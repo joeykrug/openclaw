@@ -8,6 +8,7 @@ import {
   createAgentRunRestartAbortError,
   createAgentRunSupersededAbortError,
 } from "../../run-termination.js";
+import { withoutGatewayToolCallerIdentity } from "../../tools/gateway-caller-context.js";
 import { log } from "../logger.js";
 import type { EmbeddedAgentQueueHandle } from "../run-state.js";
 import { clearActiveEmbeddedRun, setActiveEmbeddedRun } from "../runs.js";
@@ -132,7 +133,7 @@ export function createDeferredEmbeddedRunLifecycleManager(params: {
       const diagnosticOwner = createDiagnosticEmbeddedRunOwner(params);
       // Each handoff gets a fresh owner; retained callbacks from a prior CLI
       // attempt must not publish progress after replacement or lifecycle rotation.
-      cliOwner = {
+      const owner: EmbeddedAgentQueueHandle = {
         kind: "embedded",
         runId: params.runId,
         diagnosticOwner,
@@ -148,12 +149,25 @@ export function createDeferredEmbeddedRunLifecycleManager(params: {
         cancel: abort,
         abort,
       };
-      setActiveEmbeddedRun(
-        params.sessionId,
-        cliOwner,
-        params.sessionKey,
-        params.sessionFile,
-        params.agentId,
+      cliOwner = owner;
+      // No live same-run tool-caller identity exists at any handoffToCli call
+      // site: a run's own identity is rooted only inside the embedded backend,
+      // and that scope has closed before a CLI candidate starts. Any ambient
+      // identity is therefore a different attempt's, typically the parent turn
+      // that spawned this session through the in-process Gateway and whose
+      // AsyncLocalStorage the reply lane snapshot preserved. That attempt's
+      // authority binding would judge this registration against the parent's
+      // identity and reject it, so publish without a caller. This also drops
+      // the caller's operationalRunInstance, which the CLI owner never
+      // qualifies for; the owner claims only this run's cancellation.
+      withoutGatewayToolCallerIdentity(() =>
+        setActiveEmbeddedRun(
+          params.sessionId,
+          owner,
+          params.sessionKey,
+          params.sessionFile,
+          params.agentId,
+        ),
       );
       const previous = current;
       current = undefined;
