@@ -1067,6 +1067,126 @@ describe("sessions_spawn tool", () => {
     expect(mockCallArg(callGateway, 0, 1, "sessions.create")).not.toHaveProperty("fork");
   });
 
+  describe("visible session thinking inheritance", () => {
+    const acceptedCreate = () => ({
+      key: "agent:main:dashboard:thinking-child",
+      runStarted: true,
+      runId: "run-visible-thinking",
+    });
+
+    it.each([
+      {
+        name: "configured requester default outranks the parent's active turn",
+        config: {
+          agents: {
+            defaults: { subagents: { thinking: "low" } },
+            list: [{ id: "main", subagents: { thinking: "xhigh" } }],
+          },
+        },
+        requesterThinkingLevel: "off" as const,
+        expected: "xhigh",
+      },
+      {
+        name: "target agent default applies when the requester configures none",
+        config: {
+          agents: {
+            defaults: { subagents: { allowAgents: ["reviewer"] } },
+            list: [{ id: "main" }, { id: "reviewer", subagents: { thinking: "high" } }],
+          },
+        },
+        agentId: "reviewer",
+        expected: "high",
+      },
+      {
+        name: "global subagent default applies when neither agent configures one",
+        config: {
+          agents: { defaults: { subagents: { thinking: "medium" } }, list: [{ id: "main" }] },
+        },
+        expected: "medium",
+      },
+      {
+        name: "the requester's active turn is inherited without configured defaults",
+        config: { agents: { list: [{ id: "main" }] } },
+        requesterThinkingLevel: "high" as const,
+        expected: "high",
+      },
+    ])("$name", async (testCase) => {
+      const callGateway = vi.fn(async () => acceptedCreate());
+      const tool = createSessionsSpawnTool({
+        agentSessionKey: "agent:main:main",
+        config: testCase.config as never,
+        ...(testCase.requesterThinkingLevel
+          ? { requesterThinkingLevel: testCase.requesterThinkingLevel }
+          : {}),
+        callGateway: callGateway as never,
+        registerRun: vi.fn(),
+        countActiveRuns: () => 0,
+      });
+
+      const result = await tool.execute("visible-thinking", {
+        task: "investigate",
+        visible: true,
+        ...(testCase.agentId ? { agentId: testCase.agentId } : {}),
+      });
+
+      expect(result.details).toMatchObject({ status: "accepted" });
+      // Creation must carry the level; a later sessions.patch would race the first turn.
+      expect(callGateway).toHaveBeenCalledOnce();
+      expect(callGateway).toHaveBeenCalledWith(
+        "sessions.create",
+        expect.objectContaining({ thinkingLevel: testCase.expected }),
+      );
+    });
+
+    it("omits thinkingLevel when nothing is inherited", async () => {
+      const callGateway = vi.fn(async () => acceptedCreate());
+      const tool = createSessionsSpawnTool({
+        agentSessionKey: "agent:main:main",
+        config: { agents: { list: [{ id: "main" }] } } as never,
+        callGateway: callGateway as never,
+        registerRun: vi.fn(),
+        countActiveRuns: () => 0,
+      });
+
+      const result = await tool.execute("visible-thinking-default", {
+        task: "investigate",
+        visible: true,
+      });
+
+      expect(result.details).toMatchObject({ status: "accepted" });
+      // Omission leaves the child on its own configured/model default instead of "off".
+      expect(mockCallArg(callGateway, 0, 1, "sessions.create")).not.toHaveProperty("thinkingLevel");
+    });
+
+    it("rejects a malformed configured subagent thinking level before creating a session", async () => {
+      const callGateway = vi.fn();
+      const tool = createSessionsSpawnTool({
+        agentSessionKey: "agent:main:main",
+        config: {
+          agents: {
+            defaults: { subagents: { thinking: "extremely-hard" } },
+            list: [{ id: "main" }],
+          },
+        } as never,
+        callGateway: callGateway as never,
+        registerRun: vi.fn(),
+        countActiveRuns: () => 0,
+      });
+
+      const result = await tool.execute("visible-thinking-invalid", {
+        task: "investigate",
+        visible: true,
+      });
+
+      const details = requireRecord(result.details, "visible thinking rejection");
+      expect(details.status).toBe("error");
+      expect(String(details.error)).toContain(
+        'Invalid thinking level "extremely-hard". Use one of:',
+      );
+      expect(callGateway).not.toHaveBeenCalled();
+    });
+  });
+
   it("rejects cross-agent visible transcript forks", async () => {
     const callGateway = vi.fn();
     const tool = createSessionsSpawnTool({

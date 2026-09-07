@@ -31,7 +31,11 @@ import {
 import { deleteSubagentSessionForCleanup } from "../subagents/registry/subagent-session-cleanup.js";
 import { getSubagentDepthFromSessionStore } from "../subagents/spawn/subagent-depth.js";
 import { resolveSubagentSpawnOwnership } from "../subagents/spawn/subagent-spawn-ownership.js";
-import { resolveConfiguredSubagentRunTimeoutSeconds } from "../subagents/spawn/subagent-spawn-plan.js";
+import {
+  formatSubagentThinkingLevelError,
+  resolveConfiguredSubagentRunTimeoutSeconds,
+} from "../subagents/spawn/subagent-spawn-plan.js";
+import { resolveSubagentThinkingOverride } from "../subagents/spawn/subagent-spawn-thinking.js";
 import { resolveSubagentTargetPolicy } from "../subagents/spawn/subagent-target-policy.js";
 import { normalizeToolModelOverride, readToolStringParam, ToolInputError } from "./common.js";
 import {
@@ -204,8 +208,9 @@ export async function maybeSpawnVisibleSession(params: {
     sessionKey: requesterKey,
     agentId: params.options?.requesterAgentIdOverride,
   });
+  const requesterAgentConfig = resolveAgentConfig(cfg, requesterAgentId);
   const requireAgentId =
-    resolveAgentConfig(cfg, requesterAgentId)?.subagents?.requireAgentId ??
+    requesterAgentConfig?.subagents?.requireAgentId ??
     cfg.agents?.defaults?.subagents?.requireAgentId ??
     false;
   if (requireAgentId && !params.requestedAgentId) {
@@ -226,8 +231,7 @@ export async function maybeSpawnVisibleSession(params: {
     targetAgentId,
     requestedAgentId: params.requestedAgentId,
     allowAgents:
-      resolveAgentConfig(cfg, requesterAgentId)?.subagents?.allowAgents ??
-      cfg.agents?.defaults?.subagents?.allowAgents,
+      requesterAgentConfig?.subagents?.allowAgents ?? cfg.agents?.defaults?.subagents?.allowAgents,
     configuredAgentIds: listAgentIds(cfg),
   });
   if (!targetPolicy.ok) {
@@ -235,6 +239,27 @@ export async function maybeSpawnVisibleSession(params: {
   }
   const resolvedModel =
     modelOverride ?? resolveSubagentSpawnModelSelection({ cfg, agentId: targetAgentId });
+  // Visible children select effort through the same helper as hidden spawns: configured
+  // requester/target/global `subagents.thinking` first, then the requester's active turn.
+  // `thinking` is rejected above, so this path never carries a per-call override, and the
+  // saved requester entry is deliberately not consulted because it may already describe a
+  // later turn. Nothing inherited means omission, leaving the child its own model default.
+  const thinkingPlan = resolveSubagentThinkingOverride({
+    cfg,
+    requesterAgentConfig,
+    targetAgentConfig: resolveAgentConfig(cfg, targetAgentId),
+    callerThinkingRaw: params.options?.requesterThinkingLevel,
+  });
+  if (thinkingPlan.status === "error") {
+    return {
+      status: "error",
+      error: formatSubagentThinkingLevelError({
+        resolvedModel,
+        thinkingCandidateRaw: thinkingPlan.thinkingCandidateRaw,
+      }),
+    };
+  }
+  const inheritedThinkingLevel = thinkingPlan.initialSessionPatch.thinkingLevel;
   const runTimeoutSeconds = resolveConfiguredSubagentRunTimeoutSeconds({
     cfg,
     runTimeoutSeconds: params.runTimeoutSeconds,
@@ -331,6 +356,10 @@ export async function maybeSpawnVisibleSession(params: {
         // sessions.create persists the group under the legacy wire field `category`.
         ...(group ? { category: group } : {}),
         model: resolvedModel,
+        // Creation freezes inherited effort before the child's first turn; a follow-up
+        // sessions.patch would race that turn. sessions.create still owns validation, so an
+        // unsupported level is rejected here rather than silently clamped.
+        ...(inheritedThinkingLevel ? { thinkingLevel: inheritedThinkingLevel } : {}),
         task: params.task,
         parentSessionKey: requesterKey,
         // Declared spawn lineage: without it the child persists as a depth-0 root

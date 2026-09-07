@@ -52,6 +52,17 @@ export function resolveConfiguredSubagentRunTimeoutSeconds(params: {
     : cfgSubagentTimeout;
 }
 
+/** Formats the invalid-thinking-level error shared by hidden and visible subagent spawns. */
+export function formatSubagentThinkingLevelError(params: {
+  resolvedModel?: string;
+  thinkingCandidateRaw: string;
+}) {
+  const { provider, model } = splitModelRef(params.resolvedModel);
+  // The hint is provider/model-specific because valid thinking levels vary by backend.
+  const hint = formatThinkingLevels(provider, model);
+  return `Invalid thinking level "${params.thinkingCandidateRaw}". Use one of: ${hint}.`;
+}
+
 /** Resolves the subagent model plus thinking patch to apply to the spawned session. */
 export function resolveSubagentModelAndThinkingPlan(params: {
   cfg: OpenClawConfig;
@@ -79,13 +90,13 @@ export function resolveSubagentModelAndThinkingPlan(params: {
     callerThinkingRaw: params.callerThinkingRaw,
   });
   if (thinkingPlan.status === "error") {
-    const { provider, model } = splitModelRef(resolvedModel);
-    // The hint is provider/model-specific because valid thinking levels vary by backend.
-    const hint = formatThinkingLevels(provider, model);
     return {
       status: "error" as const,
       resolvedModel,
-      error: `Invalid thinking level "${thinkingPlan.thinkingCandidateRaw}". Use one of: ${hint}.`,
+      error: formatSubagentThinkingLevelError({
+        resolvedModel,
+        thinkingCandidateRaw: thinkingPlan.thinkingCandidateRaw,
+      }),
     };
   }
 

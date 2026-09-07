@@ -4,8 +4,22 @@
  */
 import { asOptionalObjectRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { normalizeThinkLevel } from "../../../auto-reply/thinking.shared.js";
+import { normalizeThinkLevel, type ThinkLevel } from "../../../auto-reply/thinking.shared.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
+
+/**
+ * Resolved inheritance for one spawn. `initialSessionPatch` is the wire-shaped
+ * result both spawn paths consume: hidden spreads it into the child row patch,
+ * visible forwards the level to atomic `sessions.create`. It stays empty when
+ * nothing is inherited so the child keeps its own configured/model default.
+ */
+export type SubagentThinkingPlan =
+  | { status: "error"; thinkingCandidateRaw: string }
+  | {
+      status: "ok";
+      thinkingOverride?: ThinkLevel;
+      initialSessionPatch: { thinkingLevel?: ThinkLevel };
+    };
 
 /** Resolves subagent thinking override and initial session patch from caller/agent config. */
 export function resolveSubagentThinkingOverride(params: {
@@ -14,7 +28,7 @@ export function resolveSubagentThinkingOverride(params: {
   targetAgentConfig?: unknown;
   thinkingOverrideRaw?: string;
   callerThinkingRaw?: string;
-}) {
+}): SubagentThinkingPlan {
   const requesterSubagents = asOptionalObjectRecord(
     asOptionalObjectRecord(params.requesterAgentConfig)?.subagents,
   );
