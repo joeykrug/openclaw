@@ -6,11 +6,14 @@ const mocks = vi.hoisted(() => ({
   resolvePluginContributionOwners: vi.fn(),
   getPluginRecord: vi.fn(),
   isPluginEnabled: vi.fn(),
-  getRemoteModelCatalogOverlay: vi.fn(),
+  getRemoteModelCatalogProviderOverlay: vi.fn(),
 }));
 
-vi.mock("../../plugins/plugin-registry.js", () => ({
+vi.mock("../../plugins/plugin-registry-contributions.js", () => ({
   resolvePluginContributionOwners: mocks.resolvePluginContributionOwners,
+}));
+
+vi.mock("../../plugins/plugin-registry-snapshot.js", () => ({
   getPluginRecord: mocks.getPluginRecord,
   isPluginEnabled: mocks.isPluginEnabled,
 }));
@@ -21,11 +24,12 @@ vi.mock("../../plugins/plugin-metadata-snapshot.js", () => ({
 }));
 
 vi.mock("../../model-catalog/remote-overlay.js", () => ({
-  getRemoteModelCatalogOverlay: mocks.getRemoteModelCatalogOverlay,
+  getRemoteModelCatalogProviderOverlay: mocks.getRemoteModelCatalogProviderOverlay,
 }));
 
 const moonshotPlugin = {
   id: "moonshot",
+  origin: "bundled",
   providers: ["moonshot"],
   modelCatalog: {
     providers: {
@@ -41,6 +45,7 @@ const moonshotPlugin = {
 
 const openrouterPlugin = {
   id: "openrouter",
+  origin: "bundled",
   providers: ["openrouter"],
   modelCatalog: {
     providers: {
@@ -56,6 +61,7 @@ const openrouterPlugin = {
 
 const openaiRuntimePlugin = {
   id: "openai",
+  origin: "bundled",
   providers: ["openai"],
   modelCatalog: {
     providers: {
@@ -72,7 +78,7 @@ const openaiRuntimePlugin = {
 describe("loadStaticManifestCatalogRowsForList", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.getRemoteModelCatalogOverlay.mockReturnValue(undefined);
+    mocks.getRemoteModelCatalogProviderOverlay.mockReturnValue(undefined);
   });
 
   it("loads only static manifest catalog rows without a provider filter", async () => {
@@ -86,6 +92,7 @@ describe("loadStaticManifestCatalogRowsForList", () => {
       index,
       manifestRegistry,
       plugins: manifestRegistry.plugins,
+      byPluginId: new Map(manifestRegistry.plugins.map((plugin) => [plugin.id, plugin])),
     });
 
     expect(
@@ -110,6 +117,7 @@ describe("loadStaticManifestCatalogRowsForList", () => {
       index: { plugins: [], diagnostics: [] },
       manifestRegistry,
       plugins: manifestRegistry.plugins,
+      byPluginId: new Map(manifestRegistry.plugins.map((plugin) => [plugin.id, plugin])),
     });
 
     expect(
@@ -129,11 +137,10 @@ describe("loadStaticManifestCatalogRowsForList", () => {
       index: { plugins: [], diagnostics: [] },
       manifestRegistry,
       plugins: manifestRegistry.plugins,
+      byPluginId: new Map(manifestRegistry.plugins.map((plugin) => [plugin.id, plugin])),
     };
-    mocks.getRemoteModelCatalogOverlay.mockReturnValue({
-      openai: {
-        models: [{ id: "gpt-refreshed", name: "Refreshed GPT" }],
-      },
+    mocks.getRemoteModelCatalogProviderOverlay.mockReturnValue({
+      models: [{ id: "gpt-refreshed", name: "Refreshed GPT" }],
     });
     mocks.getPluginRecord.mockReturnValue({ pluginId: "openai" });
     mocks.isPluginEnabled.mockReturnValue(true);
@@ -158,6 +165,7 @@ describe("loadStaticManifestCatalogRowsForList", () => {
         diagnostics: [],
       },
       plugins: [moonshotPlugin],
+      byPluginId: new Map([[moonshotPlugin.id, moonshotPlugin]]),
     };
 
     expect(

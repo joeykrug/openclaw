@@ -1,42 +1,43 @@
+import { t } from "../../i18n/index.ts";
 import type { ChatAttachment } from "../../lib/chat/chat-types.ts";
 import { generateUUID } from "../../lib/uuid.ts";
 import { getChatAttachmentDataUrl } from "./attachment-payload-store.ts";
 
-// Index/slice parsing only: a capture regex spanning a multi-megabyte payload
-// can overflow the browser regex stack before chat.send staging runs (#90098).
 function dataUrlToBase64(dataUrl: string): { content: string; mimeType: string } | null {
-  if (!dataUrl.startsWith("data:")) {
+  const commaIndex = dataUrl.indexOf(",");
+  if (!dataUrl.startsWith("data:") || commaIndex < 0) {
     return null;
   }
-  const marker = ";base64,";
-  const markerIndex = dataUrl.indexOf(marker);
-  if (markerIndex <= "data:".length || markerIndex + marker.length >= dataUrl.length) {
+  // FileReader may include MIME parameters. Validate metadata separately from
+  // the payload, so neither repeated parameters nor image bytes need a capture regex.
+  const [mimeType, ...parameters] = dataUrl.slice(5, commaIndex).split(";");
+  if (
+    !mimeType ||
+    parameters.pop() !== "base64" ||
+    parameters.some((parameter) => !/^[^=]+=[\s\S]*$/.test(parameter))
+  ) {
     return null;
   }
-  return {
-    mimeType: dataUrl.slice("data:".length, markerIndex),
-    content: dataUrl.slice(markerIndex + marker.length),
-  };
+  const content = dataUrl.slice(commaIndex + 1);
+  return content && !/[\r\n\u2028\u2029]/.test(content) ? { mimeType, content } : null;
 }
 
 /** Converts composer attachments into the base64 payload accepted by chat.send. */
 export function buildChatApiAttachments(attachments?: readonly ChatAttachment[]) {
   return attachments?.length
-    ? attachments
-        .map((attachment) => {
-          const dataUrl = getChatAttachmentDataUrl(attachment);
-          const parsed = dataUrl ? dataUrlToBase64(dataUrl) : null;
-          if (!parsed) {
-            return null;
-          }
-          return {
-            type: parsed.mimeType.startsWith("image/") ? "image" : "file",
-            mimeType: parsed.mimeType,
-            fileName: attachment.fileName,
-            content: parsed.content,
-          };
-        })
-        .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null)
+    ? attachments.map((attachment) => {
+        const dataUrl = getChatAttachmentDataUrl(attachment);
+        const parsed = dataUrl ? dataUrlToBase64(dataUrl) : null;
+        if (!parsed) {
+          throw new Error(t("chat.sendErrors.outboxPayloadMissing"));
+        }
+        return {
+          type: parsed.mimeType.startsWith("image/") ? "image" : "file",
+          mimeType: parsed.mimeType,
+          fileName: attachment.fileName,
+          content: parsed.content,
+        };
+      })
     : undefined;
 }
 

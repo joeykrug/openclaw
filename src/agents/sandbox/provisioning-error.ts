@@ -1,6 +1,18 @@
 import { formatErrorMessage } from "../../infra/errors.js";
+import {
+  isTrustedSecretSurfaceUnavailableError,
+  SECRET_DEGRADATION_RETRY_HINT,
+} from "../../secrets/runtime-degraded-state.js";
 
 const SANDBOX_PROVISIONING_ERROR_CODE = "sandbox_provisioning";
+
+/** A provider has confirmed that this exact runtime can never be resumed. */
+export class SandboxRuntimeRetiredError extends Error {
+  constructor(readonly runtimeId: string) {
+    super(`Sandbox runtime "${runtimeId}" has been permanently released.`);
+    this.name = "SandboxRuntimeRetiredError";
+  }
+}
 
 /** Model-independent sandbox setup failure that must not consume model fallbacks. */
 class SandboxProvisioningError extends Error {
@@ -19,8 +31,10 @@ export function toSandboxProvisioningError(error: unknown, backendId: string) {
   if (error instanceof SandboxProvisioningError) {
     return error;
   }
-  const message =
-    formatErrorMessage(error) || `Sandbox backend "${backendId}" provisioning failed.`;
+  const detail = formatErrorMessage(error) || `Sandbox backend "${backendId}" provisioning failed.`;
+  const message = isTrustedSecretSurfaceUnavailableError(error)
+    ? `${detail} Fix the referenced secret, run \`${SECRET_DEGRADATION_RETRY_HINT}\`, then retry.`
+    : detail;
   return new SandboxProvisioningError(message, { backendId, cause: error });
 }
 

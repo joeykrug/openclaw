@@ -2,7 +2,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { trackSqliteStatementExecutions } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../state/openclaw-agent-db.generated.js";
@@ -40,20 +42,23 @@ describe("SQLite trajectory runtime store", () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it("appends events in database order without trusting recorder-local seq", async () => {
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-      createTrajectoryEvent({ seq: 1, type: "model.started" }),
-      createTrajectoryEvent({ seq: 1, type: "model.completed" }),
-    ]);
-
+  it("appends batches in database order without trusting recorder-local seq", async () => {
+    const events = Array.from({ length: 201 }, (_, index) =>
+      createTrajectoryEvent({ seq: 1, type: `event-${index}` }),
+    );
+    const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath() });
+    const counter = trackSqliteStatementExecutions(database.db, ["append"], (sql) =>
+      /^insert into "trajectory_runtime_events"/i.test(sql) ? "append" : null,
+    );
+    try {
+      appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, events);
+      expect(counter.counts.append).toBeLessThan(10);
+    } finally {
+      counter.restore();
+    }
     await expect(
       loadSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }),
-    ).resolves.toEqual([
-      expect.objectContaining({ seq: 1, type: "model.started" }),
-      expect.objectContaining({ seq: 1, type: "model.completed" }),
-    ]);
-
-    const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath() });
+    ).resolves.toEqual(events);
     const db = getNodeSqliteKysely<TrajectoryRuntimeTestDatabase>(database.db);
     const rows = executeSqliteQuerySync(
       database.db,
@@ -63,10 +68,65 @@ describe("SQLite trajectory runtime store", () => {
         .where("session_id", "=", "session-1")
         .orderBy("seq", "asc"),
     ).rows;
-    expect(rows).toEqual([
-      { run_id: "run-1", seq: 0 },
-      { run_id: "run-1", seq: 1 },
-    ]);
+    expect(rows).toEqual(events.map((_, seq) => ({ run_id: "run-1", seq })));
+  });
+
+  it("rolls back a later batch failure and retries without losing or duplicating events", async () => {
+    const scope = { sessionId: "session-1", storePath };
+    const existing = createTrajectoryEvent({ type: "existing" });
+    appendSqliteTrajectoryRuntimeEvents(scope, [existing]);
+    const events = Array.from({ length: 100 }, (_, index) =>
+      createTrajectoryEvent({ type: `pending-${index}` }),
+    );
+    const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath() });
+    database.db.exec(`CREATE TEMP TRIGGER reject_trajectory_append
+      BEFORE INSERT ON trajectory_runtime_events WHEN NEW.seq = 65
+      BEGIN SELECT RAISE(ABORT, 'synthetic later append failure'); END`);
+    try {
+      expect(() => appendSqliteTrajectoryRuntimeEvents(scope, events)).toThrow(
+        "synthetic later append failure",
+      );
+      await expect(loadSqliteTrajectoryRuntimeEvents(scope)).resolves.toEqual([existing]);
+    } finally {
+      database.db.exec("DROP TRIGGER reject_trajectory_append");
+    }
+    appendSqliteTrajectoryRuntimeEvents(scope, events);
+    expect(loadSqliteTrajectoryRuntimeEventRowsSync(scope)).toEqual(
+      [existing, ...events].map((event, seq) => ({ event, seq })),
+    );
+  });
+
+  it.each(["2026", "0", "1969-12-31T23:59:59.000Z"])(
+    "stores Date.parse-compatible trajectory timestamp %s",
+    (timestamp) => {
+      appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
+        createTrajectoryEvent({ ts: timestamp, type: "timestamp-contract" }),
+      ]);
+
+      const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath() });
+      const db = getNodeSqliteKysely<TrajectoryRuntimeTestDatabase>(database.db);
+      const rows = executeSqliteQuerySync(
+        database.db,
+        db
+          .selectFrom("trajectory_runtime_events")
+          .select(["created_at"])
+          .where("session_id", "=", "session-1"),
+      ).rows;
+      expect(rows).toEqual([{ created_at: Date.parse(timestamp) }]);
+    },
+  );
+
+  it("rejects a foreign owner for a non-shared agent store on append and read", async () => {
+    const foreign = { agentId: "ops", sessionId: "session-1", storePath };
+    expect(() =>
+      appendSqliteTrajectoryRuntimeEvents(foreign, [createTrajectoryEvent({ type: "foreign" })]),
+    ).toThrow(/store path belongs to agent main; requested agent ops/);
+    expect(() => loadSqliteTrajectoryRuntimeEventRowsSync(foreign)).toThrow(
+      /store path belongs to agent main; requested agent ops/,
+    );
+    await expect(
+      loadSqliteTrajectoryRuntimeEvents({ agentId: "main", sessionId: "session-1", storePath }),
+    ).resolves.toEqual([]);
   });
 
   it("trims oldest rows beyond the configured byte window", async () => {
@@ -88,6 +148,90 @@ describe("SQLite trajectory runtime store", () => {
     expect(events.map((event) => event.type)).toEqual(["event-3", "event-4"]);
   });
 
+  it("trims the retained byte window without fetching UTF-8 event bodies", async () => {
+    const history = Array.from({ length: 64 }, (_, index) =>
+      createTrajectoryEvent({ type: `old-${index}`, payloadSize: 64 * 1024 }),
+    );
+    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, history);
+    const newest = createTrajectoryEvent({ type: "newest" });
+    const retained = [...history.slice(-2), newest];
+    const maxRuntimeBytes = retained.reduce(
+      (bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event), "utf8") + 1,
+      0,
+    );
+    const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath() });
+    const prepare = database.db.prepare.bind(database.db);
+    let materializedEvents = 0;
+    const prepareSpy = vi.spyOn(database.db, "prepare").mockImplementation((sql) => {
+      const statement = prepare(sql);
+      const iterate = statement.iterate.bind(statement);
+      vi.spyOn(statement, "iterate").mockImplementation(function* (...args) {
+        for (const row of iterate(...args)) {
+          if (typeof row.event_json === "string") {
+            materializedEvents += 1;
+          }
+          yield row;
+        }
+        return undefined;
+      });
+      return statement;
+    });
+    try {
+      appendSqliteTrajectoryRuntimeEvents({ maxRuntimeBytes, sessionId: "session-1", storePath }, [
+        newest,
+      ]);
+      expect(materializedEvents).toBe(0);
+    } finally {
+      prepareSpy.mockRestore();
+    }
+    await expect(
+      loadSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }),
+    ).resolves.toEqual(retained);
+  });
+
+  it.each(
+    ["UTF-8", "UTF-16le", "UTF-16be"].flatMap((encoding) =>
+      [0, -1].map((delta) => ({ encoding, delta })),
+    ),
+  )(
+    "keeps the UTF-8 byte window in $encoding with a $delta-byte adjustment",
+    async ({ encoding, delta }) => {
+      if (encoding !== "UTF-8") {
+        storePath = path.join(tempDir, `${encoding}.sqlite`);
+        const seed = new DatabaseSync(storePath);
+        try {
+          seed.exec(
+            `PRAGMA encoding = '${encoding}'; CREATE TABLE encoding_seed (id INTEGER); DROP TABLE encoding_seed;`,
+          );
+        } finally {
+          seed.close();
+        }
+        await replaceSessionEntry(
+          { sessionKey: "agent:main:main", storePath },
+          { sessionId: "session-1", updatedAt: 10 },
+        );
+      }
+      const events = ["old", "middle", "newest"].map((type) => {
+        const event = createTrajectoryEvent({ type });
+        event.data = { payload: "日本語🦞".repeat(20) };
+        return event;
+      });
+      const maxRuntimeBytes = events
+        .slice(-2)
+        .reduce(
+          (bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event), "utf8") + 1,
+          delta,
+        );
+      appendSqliteTrajectoryRuntimeEvents(
+        { maxRuntimeBytes, sessionId: "session-1", storePath },
+        events,
+      );
+      await expect(
+        loadSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }),
+      ).resolves.toEqual(events.slice(delta === 0 ? -2 : -1));
+    },
+  );
+
   it("loads a bounded trailing window in storage order", () => {
     appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
       createTrajectoryEvent({ type: "event-1" }),
@@ -103,6 +247,26 @@ describe("SQLite trajectory runtime store", () => {
 
     expect(rows.map((row) => row.event.type)).toEqual(["event-2", "event-3"]);
     expect(rows.map((row) => row.seq)).toEqual([1, 2]);
+  });
+
+  it("reads a missing trajectory store without creating an agent database", () => {
+    const missingStorePath = path.join(tempDir, "agents", "missing", "sessions", "sessions.json");
+    const missingDatabasePath = path.join(
+      tempDir,
+      "agents",
+      "missing",
+      "agent",
+      "openclaw-agent.sqlite",
+    );
+
+    expect(
+      loadSqliteTrajectoryRuntimeEventRowsSync({
+        agentId: "missing",
+        sessionId: "missing-session",
+        storePath: missingStorePath,
+      }),
+    ).toEqual([]);
+    expect(fs.existsSync(missingDatabasePath)).toBe(false);
   });
 
   it("applies maxEvents to a trailing window", () => {
@@ -153,52 +317,60 @@ describe("SQLite trajectory runtime store", () => {
     await expect(runtimeEventTypes("history")).resolves.toEqual(["recent"]);
   });
 
-  it("evicts oldest runs to the global byte budget without touching the current session", async () => {
-    const now = Date.parse("2026-07-26T00:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-      createTrajectoryEvent({ payloadSize: 200, type: "current-initial" }),
-    ]);
-    for (const [index, sessionId] of ["oldest", "middle", "newest"].entries()) {
-      await addSession(sessionId);
-      appendSqliteTrajectoryRuntimeEvents({ sessionId, storePath }, [
-        createTrajectoryEvent({
-          payloadSize: 200,
-          runId: `${sessionId}-run`,
-          sessionId,
-          type: sessionId,
-          ts: new Date(now - (3 - index) * 24 * 60 * 60 * 1_000).toISOString(),
-        }),
+  it.each([0, -1])(
+    "evicts complete runs at the global UTF-8 byte budget (%i-byte adjustment)",
+    async (delta) => {
+      const now = Date.parse("2026-07-26T00:00:00.000Z");
+      vi.useFakeTimers();
+      vi.setSystemTime(now);
+      appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
+        createTrajectoryEvent({ payloadSize: 200, type: "current-initial" }),
       ]);
-    }
-    const bytesBefore = runtimeBytesBySession();
-    const trigger = createTrajectoryEvent({
-      payloadSize: 200,
-      type: "current-newest",
-      ts: new Date(now + 60 * 60 * 1_000).toISOString(),
-    });
-    const triggerBytes = Buffer.byteLength(JSON.stringify(trigger), "utf8") + 1;
-    const maxGlobalRuntimeBytes =
-      [...bytesBefore.values()].reduce((total, bytes) => total + bytes, 0) +
-      triggerBytes -
-      (bytesBefore.get("oldest") ?? 0) -
-      (bytesBefore.get("middle") ?? 0);
+      for (const [index, sessionId] of ["oldest", "middle", "newest"].entries()) {
+        await addSession(sessionId);
+        const events = [0, 1].map((part) => {
+          const event = createTrajectoryEvent({
+            sessionId,
+            type: `${sessionId}-${part}`,
+            ts: new Date(now - (3 - index) * 24 * 60 * 60 * 1_000 + part).toISOString(),
+          });
+          event.runId = sessionId === "middle" ? undefined : "shared-run";
+          event.data = { payload: "日本語🦞".repeat(40) };
+          return event;
+        });
+        appendSqliteTrajectoryRuntimeEvents({ sessionId, storePath }, events);
+      }
+      const bytesBefore = runtimeBytesBySession();
+      const trigger = createTrajectoryEvent({
+        payloadSize: 200,
+        type: "current-newest",
+        ts: new Date(now + 60 * 60 * 1_000).toISOString(),
+      });
+      const triggerBytes = Buffer.byteLength(JSON.stringify(trigger), "utf8") + 1;
+      const maxGlobalRuntimeBytes =
+        [...bytesBefore.values()].reduce((total, bytes) => total + bytes, 0) +
+        triggerBytes -
+        (bytesBefore.get("oldest") ?? 0) -
+        (bytesBefore.get("middle") ?? 0) +
+        delta;
 
-    vi.advanceTimersByTime(60 * 60 * 1_000);
-    appendSqliteTrajectoryRuntimeEvents(
-      { maxGlobalRuntimeBytes, sessionId: "session-1", storePath },
-      [trigger],
-    );
+      vi.advanceTimersByTime(60 * 60 * 1_000);
+      appendSqliteTrajectoryRuntimeEvents(
+        { maxGlobalRuntimeBytes, sessionId: "session-1", storePath },
+        [trigger],
+      );
 
-    await expect(runtimeEventTypes("oldest")).resolves.toEqual([]);
-    await expect(runtimeEventTypes("middle")).resolves.toEqual([]);
-    await expect(runtimeEventTypes("newest")).resolves.toEqual(["newest"]);
-    await expect(runtimeEventTypes("session-1")).resolves.toEqual([
-      "current-initial",
-      "current-newest",
-    ]);
-  });
+      await expect(runtimeEventTypes("oldest")).resolves.toEqual([]);
+      await expect(runtimeEventTypes("middle")).resolves.toEqual([]);
+      await expect(runtimeEventTypes("newest")).resolves.toEqual(
+        delta === 0 ? ["newest-0", "newest-1"] : [],
+      );
+      await expect(runtimeEventTypes("session-1")).resolves.toEqual([
+        "current-initial",
+        "current-newest",
+      ]);
+    },
+  );
 
   it("rate-limits the global sweep instead of running it on every insert", async () => {
     const now = Date.parse("2026-07-26T00:00:00.000Z");

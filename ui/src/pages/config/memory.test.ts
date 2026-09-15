@@ -8,7 +8,6 @@ import {
   memoryTabForRoute,
   memoryVisibleSchemaKeys,
   narrowMemorySchema,
-  resolveMemoryBackend,
 } from "./memory-schema.ts";
 import { renderMemory } from "./memory.ts";
 
@@ -26,11 +25,8 @@ function createProps(overrides: Partial<MemoryViewProps> = {}): MemoryViewProps 
     engineSelection: { kind: "auto", engineId: "memory-core" },
     engineState: "enabled",
     engineBusy: false,
-    engineError: null,
+    engineOutcome: null,
     onEngineChange: vi.fn(),
-    backend: "builtin",
-    backendBusy: false,
-    onBackendChange: vi.fn(),
     addons: [
       {
         id: "active-memory",
@@ -55,17 +51,12 @@ function createProps(overrides: Partial<MemoryViewProps> = {}): MemoryViewProps 
     onAddonChange: vi.fn(),
     pluginsHref: "/settings/plugins",
     memoryImportHref: "/memory-import",
+    canImportMemory: true,
     overview: html`<div class="test-overview"></div>`,
     memories: html`<div class="test-memories"></div>`,
     dreams: html`<div class="test-dreams"></div>`,
     editor: html`<div class="test-editor"></div>`,
     dreamingSettings: html`<div class="test-dreaming-settings"></div>`,
-    agentId: "main",
-    agents: [
-      { value: "main", label: "Main" },
-      { value: "research", label: "Research" },
-    ],
-    onAgentChange: vi.fn(),
     ...overrides,
   };
 }
@@ -78,10 +69,9 @@ function renderInto(props: MemoryViewProps): HTMLElement {
 
 describe("renderMemory", () => {
   it.each(["overview", "memories", "dreams"] as const)(
-    "renders the shared header and agent scope on %s",
+    "renders the Memory tabs without a duplicate agent picker on %s",
     (activeTab) => {
-      const onAgentChange = vi.fn();
-      const container = renderInto(createProps({ activeTab, onAgentChange }));
+      const container = renderInto(createProps({ activeTab }));
       const header = container.querySelector(".hub-page-header");
 
       expect(header?.querySelector(".page-title")?.textContent).toBe("Memory");
@@ -91,21 +81,15 @@ describe("renderMemory", () => {
       expect(header?.querySelector(".memory-hub-tabs")).not.toBeNull();
       expect(container.textContent).not.toContain("Agent view");
 
-      const select = header?.querySelector("openclaw-agent-select") as HTMLElement & {
-        accessibleLabel?: string;
-        onSelect?: (value: string) => void;
-      };
-      expect(select.accessibleLabel).toBe("Agent");
-      select.onSelect?.("research");
-      expect(onAgentChange).toHaveBeenCalledWith("research");
+      expect(header?.querySelector("openclaw-agent-select")).toBeNull();
     },
   );
 
-  it("keeps the header action slot empty on Settings", () => {
-    const container = renderInto(createProps({ activeTab: "settings" }));
+  it("replaces the memory-import link with an admin-required note", () => {
+    const container = renderInto(createProps({ canImportMemory: false }));
 
-    expect(container.querySelector(".hub-page-header__actions")?.childElementCount).toBe(0);
-    expect(container.querySelector("openclaw-agent-select")).toBeNull();
+    expect(container.querySelector('a[href="/memory-import"]')).toBeNull();
+    expect(container.textContent).toContain("Memory import requires operator.admin access.");
   });
 
   it("shows the exclusive engine choice as one radio group over installed engines", () => {
@@ -125,11 +109,13 @@ describe("renderMemory", () => {
   it("reports whether the engine came from config or from the slot default", () => {
     const auto = renderInto(createProps());
     expect(auto.textContent).toContain("falls back to its default owner");
+    expect(auto.textContent).toContain("Using default: OpenClaw Memory");
 
     const pinned = renderInto(
       createProps({ engineSelection: { kind: "pinned", engineId: "memory-core" } }),
     );
     expect(pinned.textContent).toContain("pinned in config");
+    expect(pinned.textContent).toContain("Default: OpenClaw Memory");
   });
 
   it("keeps a configured missing engine selected and labels it unavailable", () => {
@@ -157,7 +143,9 @@ describe("renderMemory", () => {
   it("surfaces a failed engine write next to the control", () => {
     expect(renderInto(createProps()).textContent).not.toContain("Could not change");
 
-    const failed = renderInto(createProps({ engineError: "gateway rejected the change" }));
+    const failed = renderInto(
+      createProps({ engineOutcome: { kind: "error", message: "gateway rejected the change" } }),
+    );
     expect(failed.textContent).toContain("Could not change the memory engine");
     expect(failed.textContent).toContain("gateway rejected the change");
   });
@@ -169,15 +157,6 @@ describe("renderMemory", () => {
     expect(active?.getAttribute("value")).toBe("");
     expect(container.textContent).toContain("switched off");
     expect(container.textContent).not.toContain("pinned in config");
-  });
-
-  it("hides the retrieval backend row for an engine that owns its own retrieval", () => {
-    expect(renderInto(createProps({ backend: "builtin" })).textContent).toContain(
-      "Retrieval backend",
-    );
-    expect(renderInto(createProps({ backend: null })).textContent).not.toContain(
-      "Retrieval backend",
-    );
   });
 
   it("renders enabled and disabled add-ons as accessible toggles", () => {
@@ -307,21 +286,23 @@ describe("renderMemory", () => {
       })}`;
 
     const collapsed = renderInto(createProps({ editor: editor(false) }));
-    const show = collapsed.querySelector<HTMLButtonElement>(".config-show-advanced");
-    expect(show?.getAttribute("aria-pressed")).toBe("false");
+    const show = collapsed.querySelector<HTMLDetailsElement>("details.config-advanced-disclosure");
+    expect(show?.open).toBe(false);
     expect(collapsed.textContent).not.toContain("Advanced memory field");
-    show?.click();
+    show!.open = true;
+    show!.dispatchEvent(new Event("toggle"));
     expect(onAdvancedChange).toHaveBeenCalledWith(true);
 
     const expanded = renderInto(createProps({ editor: editor(true) }));
-    const hide = expanded.querySelector<HTMLButtonElement>(".config-show-advanced");
-    expect(hide?.getAttribute("aria-pressed")).toBe("true");
+    const hide = expanded.querySelector<HTMLDetailsElement>("details.config-advanced-disclosure");
+    expect(hide?.open).toBe(true);
     expect(expanded.textContent).toContain("Advanced memory field");
-    hide?.click();
+    hide!.open = false;
+    hide!.dispatchEvent(new Event("toggle"));
     expect(onAdvancedChange).toHaveBeenCalledWith(false);
 
     const overview = renderInto(createProps({ activeTab: "overview", editor: editor(false) }));
-    expect(overview.querySelector(".config-show-advanced")).toBeNull();
+    expect(overview.querySelector("details.config-advanced-disclosure")).toBeNull();
   });
 });
 
@@ -335,7 +316,7 @@ describe("memoryTabForRoute", () => {
   });
 
   it("routes old tabless schema links to Settings without changing the plain landing", () => {
-    expect(memoryTabForRoute({ section: "memory", targetBlockId: "memory-backend" })).toBe(
+    expect(memoryTabForRoute({ section: "memory", targetBlockId: "config-section-memory" })).toBe(
       "settings",
     );
     expect(memoryTabForRoute({ targetBlockId: "config-section-memory" })).toBe("settings");
@@ -348,7 +329,7 @@ describe("memoryTabForRoute", () => {
         pathname: "/settings/memory/dreams",
         tab: "settings",
         section: "memory",
-        targetBlockId: "memory-backend",
+        targetBlockId: "config-section-memory",
       }),
     ).toBe("dreams");
     expect(memoryTabForRoute({ pathname: "/settings/memory" })).toBe("overview");
@@ -356,46 +337,17 @@ describe("memoryTabForRoute", () => {
 });
 
 describe("memorySchemaKeysForTab", () => {
-  it("reveals qmd sub-config only when qmd is the selected backend", () => {
-    expect(memorySchemaKeysForTab("overview", "builtin")).toEqual([]);
-    expect(memorySchemaKeysForTab("memories", "builtin")).toEqual([]);
-    expect(memorySchemaKeysForTab("dreams", "qmd")).toEqual([]);
-    expect(memorySchemaKeysForTab("settings", "builtin")).toEqual(["citations", "search"]);
-    expect(memorySchemaKeysForTab("settings", "qmd")).toEqual(["citations", "qmd", "search"]);
-    // No applicable backend: qmd's sub-config belongs to a backend nothing reads.
-    expect(memorySchemaKeysForTab("settings", null)).toEqual(["citations", "search"]);
+  it("shows builtin memory settings only on Settings", () => {
+    expect(memorySchemaKeysForTab("overview")).toEqual([]);
+    expect(memorySchemaKeysForTab("memories")).toEqual([]);
+    expect(memorySchemaKeysForTab("dreams")).toEqual([]);
+    expect(memorySchemaKeysForTab("settings")).toEqual(["citations", "search"]);
   });
 });
 
 describe("memoryVisibleSchemaKeys", () => {
-  it("hides qmd until qmd is the selected backend and backend when no engine reads it", () => {
-    expect([...memoryVisibleSchemaKeys("builtin")].toSorted()).toEqual([
-      "backend",
-      "citations",
-      "search",
-    ]);
-    expect([...memoryVisibleSchemaKeys("qmd")].toSorted()).toEqual([
-      "backend",
-      "citations",
-      "qmd",
-      "search",
-    ]);
-    expect([...memoryVisibleSchemaKeys(null)].toSorted()).toEqual(["citations", "search"]);
-  });
-});
-
-describe("resolveMemoryBackend", () => {
-  it("reports a backend only for the memory-core slot owner", () => {
-    expect(resolveMemoryBackend({})).toBe("builtin");
-    expect(resolveMemoryBackend({ memory: { backend: "qmd" } })).toBe("qmd");
-    // Another engine owns the slot, so nothing reads memory.backend.
-    expect(
-      resolveMemoryBackend({
-        memory: { backend: "qmd" },
-        plugins: { slots: { memory: "memory-lancedb" } },
-      }),
-    ).toBeNull();
-    expect(resolveMemoryBackend({ plugins: { slots: { memory: "none" } } })).toBeNull();
+  it("matches the builtin Settings editor", () => {
+    expect(memoryVisibleSchemaKeys()).toEqual(["citations", "search"]);
   });
 });
 
@@ -406,10 +358,8 @@ describe("narrowMemorySchema", () => {
       memory: {
         type: "object",
         properties: {
-          backend: { type: "string" },
           citations: { type: "string" },
           search: { type: "object" },
-          qmd: { type: "object" },
         },
       },
       tools: { type: "object" },

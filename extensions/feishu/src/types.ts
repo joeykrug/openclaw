@@ -62,6 +62,12 @@ export type FeishuSendResult = {
 
 export type FeishuChatType = "p2p" | "group" | "topic_group" | "private";
 
+export function normalizeFeishuEventChatType(value: unknown): FeishuChatType | undefined {
+  return value === "group" || value === "topic_group" || value === "private" || value === "p2p"
+    ? value
+    : undefined;
+}
+
 export function isFeishuGroupChatType(chatType: FeishuChatType | undefined): boolean {
   return chatType === "group" || chatType === "topic_group";
 }
@@ -76,6 +82,8 @@ export type FeishuMessageInfo = {
   content: string;
   contentType: string;
   createTime?: number;
+  /** Root message ID for replies inside Feishu topics. */
+  rootId?: string;
   /** Feishu thread ID (omt_xxx) — present when the message belongs to a topic thread. */
   threadId?: string;
 };

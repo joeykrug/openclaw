@@ -1,3 +1,24 @@
+import { resolveFailoverReasonFromError } from "../agents/failover-error.js";
+import { projectInternalRealtimeVoicePublicConfig } from "../talk/provider-internal.js";
+import type { CreateTalkRealtimeRelaySessionParams } from "./talk-realtime-relay-state.js";
+
+export function resolveTalkRealtimeRelayPresentation(
+  params: Pick<CreateTalkRealtimeRelaySessionParams, "provider" | "providerConfig" | "model">,
+) {
+  const publicModel = projectInternalRealtimeVoicePublicConfig({
+    provider: params.provider,
+    providerConfig: params.providerConfig,
+    config: { model: params.model },
+  }).model;
+  const opaqueRoute =
+    typeof params.model === "string" && params.model.length > 0 && publicModel !== params.model;
+  return {
+    publicModel,
+    publicError: (error: unknown) =>
+      new Error(projectTalkRealtimeRelayProviderError(params.provider.id, opaqueRoute, error)),
+  };
+}
+
 type TalkRealtimeRelayIssue = {
   code: "realtime_unavailable";
   message: string;
@@ -37,4 +58,31 @@ export function buildTalkRealtimeRelayIssuePayload(
     transport: issue.transport,
     phase: issue.phase,
   };
+}
+
+function projectTalkRealtimeRelayProviderError(
+  provider: string,
+  opaqueRoute: boolean,
+  error: unknown,
+): string {
+  if (opaqueRoute) {
+    return "Realtime provider error.";
+  }
+  switch (resolveFailoverReasonFromError(error, provider)) {
+    case "auth":
+    case "auth_permanent":
+      return "Realtime provider authentication failed. Check the provider credentials and try again.";
+    case "format":
+    case "model_not_found":
+      return "Realtime session configuration was rejected. Check the provider and model settings.";
+    case "rate_limit":
+    case "billing":
+      return "Realtime provider cannot start this session right now. Try again later.";
+    case "timeout":
+    case "overloaded":
+    case "server_error":
+      return "Realtime provider is unavailable. Try again later.";
+    default:
+      return "Realtime provider error.";
+  }
 }

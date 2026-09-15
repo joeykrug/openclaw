@@ -427,9 +427,11 @@ export async function handleNotifyCommand(params: {
   }
 
   if (params.action === "status" || params.action === "") {
-    const [current, subscribers, pending] = await Promise.all([
+    const [current, subscriberCount, pending] = await Promise.all([
       subscriberStore.lookup(targetStoreKey),
-      subscriberStore.entries(),
+      subscriberStore.count
+        ? subscriberStore.count()
+        : subscriberStore.entries().then((entries) => entries.length),
       listDevicePairing(),
     ]);
     const enabled = Boolean(current);
@@ -438,7 +440,7 @@ export async function handleNotifyCommand(params: {
       text: [
         `Pair request notifications: ${enabled ? "enabled" : "disabled"} for this chat.`,
         `Mode: ${mode}`,
-        `Subscribers: ${subscribers.length}`,
+        `Subscribers: ${subscriberCount}`,
         `Pending requests: ${pending.pending.length}`,
         "",
         "Use /pair notify on|off|once",
@@ -454,14 +456,13 @@ export function createPairingNotifierService(api: OpenClawPluginApi): OpenClawPl
 
   return {
     id: "device-pair-notifier",
-    start: async () => {
+    start: () => {
       const tick = async () => {
         await runNotifyPoll(api);
       };
 
-      await tick().catch((err: unknown) => {
-        api.logger.warn(`device-pair: initial notify poll failed: ${formatErrorMessage(err)}`);
-      });
+      // Pairing notifications are eventual background work. Starting on the
+      // existing interval keeps SQLite pairing scans out of Gateway readiness.
       notifyInterval = setInterval(() => {
         tick().catch((err: unknown) => {
           api.logger.warn(`device-pair: notify poll failed: ${formatErrorMessage(err)}`);

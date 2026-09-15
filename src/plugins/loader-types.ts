@@ -1,14 +1,17 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import type { GatewayRequestHandler } from "../gateway/server-methods/types.js";
+import type { PluginCapabilityCatalogContext } from "./capability-catalog-context.types.js";
+import type { PluginCapabilityCatalog } from "./capability-catalog.types.js";
 import type { PluginDiscoveryResult } from "./discovery.js";
 import type { PluginManifestRegistry } from "./manifest-registry.js";
-import type { PluginRegistryParams } from "./registry-types.js";
+import type { PluginRegistry, PluginRegistryParams } from "./registry-types.js";
 import type { CreatePluginRuntimeOptions } from "./runtime/types.js";
 import type { PluginSdkResolutionPreference } from "./sdk-alias.js";
 import type { PluginLogger } from "./types.js";
 
 export type PluginRuntimeSubagentMode = "default" | "explicit" | "gateway-bindable";
+export type ChannelPluginLoadIntent = "full" | "setup";
 
 /** Inputs shared by runtime, snapshot, and CLI-metadata plugin loading. */
 export type PluginLoadOptions = {
@@ -24,6 +27,8 @@ export type PluginLoadOptions = {
   logger?: PluginLogger;
   coreGatewayHandlers?: Record<string, GatewayRequestHandler>;
   coreGatewayMethodNames?: readonly string[];
+  /** Registry-construction fact supplied by the process composition root. */
+  allowProcessHomeSessionCatalogs?: boolean;
   hostServices?: PluginRegistryParams["hostServices"];
   runtimeOptions?: CreatePluginRuntimeOptions;
   startupTrace?: {
@@ -31,19 +36,29 @@ export type PluginLoadOptions = {
   };
   pluginSdkResolution?: PluginSdkResolutionPreference;
   cache?: boolean;
-  mode?: "full" | "validate";
+  mode?: "full" | "validate" | "cli-metadata";
   onlyPluginIds?: string[];
   includeSetupOnlyChannelPlugins?: boolean;
   forceSetupOnlyChannelPlugins?: boolean;
-  requireSetupEntryForSetupOnlyChannelPlugins?: boolean;
-  /** Prefer opted-in channel setup entries for the pre-listen startup surface. */
-  preferSetupRuntimeForChannelPlugins?: boolean;
-  /** Load channel runtime entries even when setup entries are available. */
-  forceFullRuntimeForChannelPlugins?: boolean;
-  /** Prefer bundled JavaScript artifacts over source TypeScript entrypoints. */
+  /** Select full runtime registration or the lightweight unconfigured-channel setup path. */
+  channelPluginLoadIntent?: ChannelPluginLoadIntent;
+  /** Built hosts prefer canonical checkout artifacts by default; false retains source execution. */
   preferBuiltPluginArtifacts?: boolean;
   toolDiscovery?: boolean;
+  /** Native host operations supplied by a runtime composition root. */
+  capabilityCatalogContext?: PluginCapabilityCatalogContext;
+  /** Resolve declared descriptors for this family without full runtime registration. */
+  capabilityCatalog?: {
+    family: keyof PluginCapabilityCatalog;
+    context: PluginCapabilityCatalogContext;
+  };
   activate?: boolean;
+  /** Staged Gateway candidates expose runtime APIs only after publication or owner preparation. */
+  runtimeSideEffects?: boolean;
+  previousRegistry?: PluginRegistry;
+  replacePluginIds?: readonly string[];
+  /** Validate captured source before evaluation; this never grants plugin authority. */
+  expectedSourceDigests?: Readonly<Record<string, string>>;
   loadModules?: boolean;
   throwOnLoadError?: boolean;
   manifestRegistry?: PluginManifestRegistry;

@@ -1,13 +1,11 @@
 // Fetches and normalizes MiniMax provider usage records.
 import { asDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import { readProviderJsonResponse } from "../agents/provider-http-errors.js";
 import { isRecord } from "../utils.js";
 import { readTrimmedStringAlias } from "../utils/string-readers.js";
 import {
-  buildUsageHttpErrorSnapshot,
-  discardUsageResponseBody,
-  fetchJson,
+  buildUsageErrorSnapshot,
+  fetchUsageJson,
   parseFiniteNumber,
 } from "./provider-usage.fetch.shared.js";
 import { clampPercent, PROVIDER_LABELS } from "./provider-usage.shared.js";
@@ -16,12 +14,6 @@ import type { ProviderUsageSnapshot, UsageWindow } from "./provider-usage.types.
 type MinimaxBaseResp = {
   status_code?: number;
   status_msg?: string;
-};
-
-type MinimaxUsageResponse = {
-  base_resp?: MinimaxBaseResp;
-  data?: Record<string, unknown>;
-  [key: string]: unknown;
 };
 
 type FetchMinimaxUsageOptions = {
@@ -529,9 +521,10 @@ export async function fetchMinimaxUsage(
   fetchFn: typeof fetch,
   options?: FetchMinimaxUsageOptions,
 ): Promise<ProviderUsageSnapshot> {
-  const res = await fetchJson(
-    resolveMinimaxUsageUrl(options?.baseUrl),
-    {
+  const parsed = await fetchUsageJson({
+    provider: "minimax",
+    url: resolveMinimaxUsageUrl(options?.baseUrl),
+    init: {
       method: "GET",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -541,36 +534,19 @@ export async function fetchMinimaxUsage(
     },
     timeoutMs,
     fetchFn,
-  );
-
-  if (!res.ok) {
-    await discardUsageResponseBody(res);
-    return buildUsageHttpErrorSnapshot({
-      provider: "minimax",
-      status: res.status,
-    });
+    malformedResponseError: "Invalid JSON",
+  });
+  if (!parsed.ok) {
+    return parsed.snapshot;
   }
-
-  const data = await readProviderJsonResponse<MinimaxUsageResponse>(res, "minimax usage").catch(
-    () => null,
-  );
+  const data = parsed.data;
   if (!isRecord(data)) {
-    return {
-      provider: "minimax",
-      displayName: PROVIDER_LABELS.minimax,
-      windows: [],
-      error: "Invalid JSON",
-    };
+    return buildUsageErrorSnapshot("minimax", "Invalid JSON");
   }
 
-  const baseResp = isRecord(data.base_resp) ? data.base_resp : undefined;
+  const baseResp = isRecord(data.base_resp) ? (data.base_resp as MinimaxBaseResp) : undefined;
   if (baseResp && typeof baseResp.status_code === "number" && baseResp.status_code !== 0) {
-    return {
-      provider: "minimax",
-      displayName: PROVIDER_LABELS.minimax,
-      windows: [],
-      error: baseResp.status_msg?.trim() || "API error",
-    };
+    return buildUsageErrorSnapshot("minimax", baseResp.status_msg?.trim() || "API error");
   }
 
   const payload = isRecord(data.data) ? data.data : data;
@@ -600,19 +576,10 @@ export async function fetchMinimaxUsage(
       usedPercent = deriveUsedPercent(usageSource);
     }
     if (usedPercent === null) {
-      return {
-        provider: "minimax",
-        displayName: PROVIDER_LABELS.minimax,
-        windows: [],
-        error: "Unsupported response shape",
-      };
+      return buildUsageErrorSnapshot("minimax", "Unsupported response shape");
     }
 
-    const resetAt =
-      parseEpoch(pickString(usageRecord, RESET_KEYS)) ??
-      parseEpoch(pickNumber(usageRecord, RESET_KEYS)) ??
-      parseEpoch(pickString(payload, RESET_KEYS)) ??
-      parseEpoch(pickNumber(payload, RESET_KEYS));
+    const resetAt = pickEpoch(usageRecord, RESET_KEYS) ?? pickEpoch(payload, RESET_KEYS);
     windows = [
       {
         label: deriveWindowLabel(usageRecord),

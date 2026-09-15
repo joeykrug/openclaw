@@ -2,18 +2,23 @@
  * Tests agent harness task runtime scope, persistence, and completion delivery.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { deliverSubagentAnnouncement } from "../agents/subagent-announce-delivery.js";
+import { deliverSubagentAnnouncement } from "../agents/subagents/announce/subagent-announce-delivery.js";
+import { getPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
 import { createAgentHarnessTaskRuntimeScope } from "../tasks/agent-harness-task-runtime-scope.js";
 import { createRunningTaskRun, finalizeTaskRunByRunId } from "../tasks/detached-task-runtime.js";
 import { listTaskRecords } from "../tasks/runtime-internal.js";
+import { captureTaskExecutionOwner } from "../tasks/task-execution-owner.js";
 import {
   createAgentHarnessTaskRuntime,
   deliverAgentHarnessTaskCompletion,
   isDurableAgentHarnessCompletionDelivery,
 } from "./agent-harness-task-runtime.js";
 
-vi.mock("../agents/subagent-announce-delivery.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../agents/subagent-announce-delivery.js")>();
+vi.mock("../agents/subagents/announce/subagent-announce-delivery.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import("../agents/subagents/announce/subagent-announce-delivery.js")
+    >();
   return {
     ...actual,
     deliverSubagentAnnouncement: vi.fn(async () => ({ delivered: true, path: "steered" })),
@@ -32,6 +37,10 @@ vi.mock("../tasks/runtime-internal.js", () => ({
   listTaskRecords: vi.fn(() => []),
 }));
 
+vi.mock("../tasks/task-execution-owner.js", () => ({
+  captureTaskExecutionOwner: vi.fn(),
+}));
+
 describe("agent-harness-task-runtime", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -41,6 +50,39 @@ describe("agent-harness-task-runtime", () => {
   function createScope(requesterSessionKey = "agent:main:channel:C123") {
     return createAgentHarnessTaskRuntimeScope({ requesterSessionKey });
   }
+
+  it("records the scoped harness process identity without recapturing a reused PID", () => {
+    const executionOwner = { host: "gateway-host", pid: 4321, startIdentity: 100 };
+    vi.mocked(captureTaskExecutionOwner).mockReturnValue(executionOwner);
+    const runtime = createAgentHarnessTaskRuntime({
+      runtime: "subagent",
+      taskKind: "example-harness",
+      scope: createScope(),
+      executionPid: executionOwner.pid,
+    });
+    vi.mocked(captureTaskExecutionOwner).mockReturnValue({
+      ...executionOwner,
+      startIdentity: 200,
+    });
+
+    for (const runId of ["child-1", "child-2"]) {
+      const task = runtime.createRunningTaskRun({ runId, task: "do work" });
+      expect(task.executionOwner).toEqual(executionOwner);
+    }
+    expect(captureTaskExecutionOwner).toHaveBeenCalledExactlyOnceWith(executionOwner.pid);
+  });
+
+  it("keeps an unidentified or remote harness owner unknown", () => {
+    const runtime = createAgentHarnessTaskRuntime({
+      runtime: "subagent",
+      taskKind: "example-harness",
+      scope: createScope(),
+    });
+    const task = runtime.createRunningTaskRun({ runId: "child-1", task: "remote work" });
+
+    expect(task.executionOwner).toBeUndefined();
+    expect(captureTaskExecutionOwner).not.toHaveBeenCalled();
+  });
 
   it("scopes task lifecycle mutations to the owning requester session", () => {
     const runtime = createAgentHarnessTaskRuntime({
@@ -163,8 +205,18 @@ describe("agent-harness-task-runtime", () => {
   });
 
   it("delivers a generic harness completion through subagent announcement delivery", async () => {
+    const gatewayContextResolver = vi.fn();
+    vi.mocked(deliverSubagentAnnouncement).mockImplementationOnce(async () => {
+      expect(getPluginRuntimeGatewayRequestScope()?.resolveGatewayContext).toBe(
+        gatewayContextResolver,
+      );
+      return { delivered: true, path: "steered" };
+    });
     await deliverAgentHarnessTaskCompletion({
-      scope: createScope("agent:main:main"),
+      scope: createAgentHarnessTaskRuntimeScope({
+        requesterSessionKey: "agent:main:main",
+        gatewayContextResolver,
+      }),
       childSessionKey: "harness-thread:child",
       childSessionId: "child",
       announceId: "harness:parent:child:succeeded",
@@ -178,12 +230,14 @@ describe("agent-harness-task-runtime", () => {
     expect(deliverSubagentAnnouncement).toHaveBeenCalledWith(
       expect.objectContaining({
         requesterSessionKey: "agent:main:main",
-        announceId: "harness:parent:child:succeeded",
         sourceSessionKey: "harness-thread:child",
         sourceTool: "agent_harness_task",
         expectsCompletionMessage: true,
         directIdempotencyKey: "announce:harness:parent:child:succeeded",
       }),
+    );
+    expect(vi.mocked(deliverSubagentAnnouncement).mock.calls[0]?.[0]).not.toHaveProperty(
+      "resolveGatewayContext",
     );
   });
 

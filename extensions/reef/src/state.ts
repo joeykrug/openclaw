@@ -3,24 +3,21 @@ import { gcm } from "@noble/ciphers/aes.js";
 import { concatBytes, randomBytes } from "@noble/hashes/utils.js";
 import type { PluginRuntime } from "openclaw/plugin-sdk/core";
 import type { PluginStateSyncKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
+// Import from defining modules, not the protocol barrel: index.js re-exports
+// guard-adapters, whose provider-http graph doctor enumeration must not cold-load.
+import { canonicalBytes } from "../protocol/canonical.js";
+import { base64, base64url, decodeUtf8, fromBase64, fromBase64url } from "../protocol/encoding.js";
 import {
-  base64,
-  base64url,
-  canonicalBytes,
-  decodeUtf8,
-  fromBase64,
-  fromBase64url,
-  generateIdentity,
   REEF_ENVELOPE_MAX_AGE_SECONDS,
   validateMessageBody,
   type CompletedReplay,
   type MessageBody,
   type ReplayClaim,
   type ReplayStore,
-  type ReviewApproval,
-  type ReviewRequest,
-  type SignedReceipt,
-} from "../protocol/index.js";
+} from "../protocol/envelope.js";
+import { generateIdentity } from "../protocol/identity.js";
+import type { ReviewApproval, ReviewRequest } from "../protocol/pipeline.js";
+import type { SignedReceipt } from "../protocol/receipts.js";
 import { openReefAuditStore } from "./audit-state.js";
 import { loadReefIdentityBinding, type ReefIdentityBinding } from "./registration-state.js";
 import type { ReefKeys } from "./types.js";
@@ -409,7 +406,11 @@ export class ReviewApprovalStore {
   readonly #store: PluginStateSyncKeyedStore<ReefReviewRecord>;
   readonly #maxEntries: number;
 
-  constructor(runtime: PluginRuntime, maxEntries = REEF_REVIEWS_MAX_ENTRIES) {
+  constructor(
+    runtime: PluginRuntime,
+    maxEntries = REEF_REVIEWS_MAX_ENTRIES,
+    private readonly authoritySignal?: AbortSignal,
+  ) {
     this.#maxEntries = maxEntries;
     this.#store = runtime.state.openSyncKeyedStore<ReefReviewRecord>({
       namespace: REEF_REVIEWS_NAMESPACE,
@@ -424,6 +425,9 @@ export class ReviewApprovalStore {
       throw new Error("Reef review retention requires atomic plugin-state deleteIf");
     }
     while (true) {
+      if (this.#store.count && this.#store.count() < this.#maxEntries) {
+        return;
+      }
       const entries = this.#store.entries();
       if (entries.length < this.#maxEntries) {
         return;
@@ -439,6 +443,7 @@ export class ReviewApprovalStore {
   }
 
   async request(review: ReviewRequest): Promise<ReviewApproval | undefined> {
+    this.authoritySignal?.throwIfAborted();
     const current = this.#store.lookup(review.approvalDigest);
     if (current?.approved !== undefined) {
       return { approved: current.approved, approvalDigest: review.approvalDigest };
@@ -456,23 +461,36 @@ export class ReviewApprovalStore {
       : { approved: persisted.approved, approvalDigest: review.approvalDigest };
   }
 
-  async decide(digest: string, approved: boolean): Promise<boolean> {
+  async lookupDecision(
+    approvalDigest: string,
+  ): Promise<"none" | "pending" | { approved: boolean }> {
+    this.authoritySignal?.throwIfAborted();
+    const current = this.#store.lookup(approvalDigest);
+    if (!current) {
+      return "none";
+    }
+    return current.approved === undefined ? "pending" : { approved: current.approved };
+  }
+
+  async decide(digest: string, approved: boolean): Promise<ReviewRequest | undefined> {
     const update = this.#store.update;
     if (!update) {
       throw new Error("Reef review state requires atomic plugin-state updates");
     }
-    let found = false;
+    let decided: ReviewRequest | undefined;
+    this.authoritySignal?.throwIfAborted();
     update(digest, (current) => {
       if (!current) {
         return undefined;
       }
-      found = true;
+      decided = structuredClone(current.review);
       return { ...current, approved };
     });
-    return found;
+    return decided;
   }
 
   async list(): Promise<ReviewRequest[]> {
+    this.authoritySignal?.throwIfAborted();
     return this.#store
       .entries()
       .filter((entry) => entry.value.approved === undefined)
@@ -481,10 +499,10 @@ export class ReviewApprovalStore {
 }
 
 export class ReefDeliveredStore {
-  readonly #store: PluginStateSyncKeyedStore<{ id: string }>;
+  readonly #delivered: PluginStateSyncKeyedStore<{ id: string }>;
 
   constructor(runtime: PluginRuntime, maxEntries = REEF_DELIVERED_MAX_ENTRIES) {
-    this.#store = runtime.state.openSyncKeyedStore<{ id: string }>({
+    this.#delivered = runtime.state.openSyncKeyedStore<{ id: string }>({
       namespace: REEF_DELIVERED_NAMESPACE,
       maxEntries,
       overflowPolicy: "reject-new",
@@ -495,16 +513,22 @@ export class ReefDeliveredStore {
   }
 
   async has(id: string): Promise<boolean> {
-    return this.#store.lookup(id)?.id === id;
+    return this.#delivered.lookup(id)?.id === id;
+  }
+
+  async status(id: string): Promise<"delivered" | undefined> {
+    return this.#delivered.lookup(id)?.id === id ? "delivered" : undefined;
+  }
+
+  async confirm(id: string): Promise<void> {
+    const inserted = this.#delivered.registerIfAbsent(id, { id });
+    if (!inserted && this.#delivered.lookup(id)?.id !== id) {
+      throw new Error("Failed persisting Reef delivered marker");
+    }
   }
 
   async add(id: string): Promise<void> {
-    if (this.#store.lookup(id)?.id === id) {
-      return;
-    }
-    if (!this.#store.registerIfAbsent(id, { id }) && this.#store.lookup(id)?.id !== id) {
-      throw new Error("Failed persisting Reef delivered marker");
-    }
+    await this.confirm(id);
   }
 }
 
@@ -588,6 +612,7 @@ export function openStores(
     auditMaxEntries?: number;
     replayMaxEntries?: number;
     deliveredMaxEntries?: number;
+    authoritySignal?: AbortSignal;
   } = {},
 ) {
   assertReefIdentityMigrationComplete(runtime);
@@ -599,7 +624,7 @@ export function openStores(
       randomBytes,
       options.replayMaxEntries,
     ),
-    reviews: new ReviewApprovalStore(runtime),
+    reviews: new ReviewApprovalStore(runtime, undefined, options.authoritySignal),
     delivered: new ReefDeliveredStore(runtime, options.deliveredMaxEntries),
   };
 }

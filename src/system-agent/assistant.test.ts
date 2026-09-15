@@ -52,7 +52,11 @@ describe("OpenClaw assistant", () => {
     expect(SYSTEM_AGENT_SYSTEM_PROMPT).toContain("call configure_gateway");
     expect(SYSTEM_AGENT_SYSTEM_PROMPT).toContain("call import_memory");
     expect(SYSTEM_AGENT_SYSTEM_PROMPT).toContain("default agent's existing workspace");
-    expect(SYSTEM_AGENT_SYSTEM_PROMPT).toContain("Never ask for or repeat a credential");
+    expect(SYSTEM_AGENT_SYSTEM_PROMPT).toContain("Never ask for or repeat reusable secrets");
+  });
+
+  it("does not tell the fallback planner to solicit secrets", () => {
+    expect(SYSTEM_AGENT_ASSISTANT_SYSTEM_PROMPT).not.toMatch(/\bask for secrets?\b/iu);
   });
 
   it("keeps remote Gateway mode outside both hosted chat planners", () => {
@@ -73,6 +77,15 @@ describe("OpenClaw assistant", () => {
       reply: "Aye aye.",
       command: "restart gateway",
     });
+  });
+
+  it.each([
+    ['[0] {"reply":"Ready."}', { reply: "Ready." }],
+    ['{"reply":"A } brace."} {"reply":"Later."}', { reply: "A } brace." }],
+    ['prefix "{not-json}" {"reply":"Later."}', null],
+    ['{"reply":"First.","extra":{"nested":true}} trailing }', { reply: "First." }],
+  ])("preserves object-only, first-object extraction: %s", (input, expected) => {
+    expect(parseSystemAgentAssistantPlanText(input)).toEqual(expected);
   });
 
   it("rejects non-JSON and empty plans but accepts chat-only replies", () => {

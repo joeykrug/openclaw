@@ -51,8 +51,7 @@ async function expectWebhookTimeout(promise: Promise<unknown>): Promise<void> {
     name: "TimeoutError",
     message: "request timed out",
   });
-  await vi.advanceTimersByTimeAsync(DISCORD_REST_TIMEOUT_MS);
-  await rejection;
+  await Promise.all([vi.advanceTimersByTimeAsync(DISCORD_REST_TIMEOUT_MS), rejection]);
 }
 
 describe("sendWebhookMessageDiscord timeout", () => {
@@ -85,15 +84,27 @@ describe("sendWebhookMessageDiscord timeout", () => {
     await expectWebhookTimeout(sendWebhookMessageDiscord("hello", opts));
   });
 
+  it("aborts rate-limit backoff at the request deadline without leaving a retry timer", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn<typeof fetch>(async () => {
+      return new Response(JSON.stringify({ message: "Slow down", retry_after: 60 }), {
+        status: 429,
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expectWebhookTimeout(sendWebhookMessageDiscord("hello", opts));
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("cleans up the deadline after a normal response", async () => {
     vi.useFakeTimers();
     vi.stubGlobal(
       "fetch",
       vi.fn<typeof fetch>(async () => {
-        return new Response(JSON.stringify({ id: "message-1", channel_id: "channel-1" }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        return Response.json({ id: "message-1", channel_id: "channel-1" });
       }),
     );
 

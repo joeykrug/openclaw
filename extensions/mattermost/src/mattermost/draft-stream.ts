@@ -1,5 +1,7 @@
 // Mattermost plugin module implements draft stream behavior.
+import { isChannelPartialDeliveryError } from "openclaw/plugin-sdk/channel-inbound";
 import { createFinalizableDraftLifecycle } from "openclaw/plugin-sdk/channel-outbound";
+import { toErrorObject } from "openclaw/plugin-sdk/error-runtime";
 import { chunkMarkdownTextWithMode } from "openclaw/plugin-sdk/reply-chunking";
 import { sliceUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import {
@@ -39,6 +41,7 @@ type MattermostDraftStream = {
   flush: () => Promise<void>;
   postId: () => string | undefined;
   clear: () => Promise<void>;
+  deleteCurrentMessage: () => Promise<void>;
   discardPending: () => Promise<void>;
   seal: () => Promise<void>;
   stop: () => Promise<void>;
@@ -118,6 +121,12 @@ export function createMattermostDraftStream(params: {
   );
   const throttleMs = Math.max(250, params.throttleMs ?? DEFAULT_THROTTLE_MS);
   const streamState = { stopped: false, final: false };
+  let terminalAcceptedDeliveryError: Error | undefined;
+  const assertNoAcceptedDeliveryFailure = () => {
+    if (terminalAcceptedDeliveryError !== undefined) {
+      throw terminalAcceptedDeliveryError;
+    }
+  };
   type DraftGeneration = {
     postId?: string;
     lastSentText: string;
@@ -135,9 +144,6 @@ export function createMattermostDraftStream(params: {
   };
   const sealedAssistantTexts: Array<{ text: string; requiresBlockBoundary: boolean }> = [];
   const publishedAssistantParts = new Map<string, MattermostDraftPublishedPart>();
-  const trackPublishedAssistantPart = (part: MattermostDraftPublishedPart) => {
-    publishedAssistantParts.set(part.messageId, part);
-  };
 
   const sendOrEditStreamMessage = async (text: string): Promise<boolean> => {
     if (streamState.stopped && !streamState.final) {
@@ -168,22 +174,27 @@ export function createMattermostDraftStream(params: {
           message: normalized,
           rootId: params.rootId,
         });
-        const postId = sent.id?.trim();
-        if (!postId) {
-          streamState.stopped = true;
-          params.warn?.("mattermost stream preview stopped (missing post id from create)");
-          return false;
-        }
-        target.postId = postId;
+        target.postId = sent.id;
         target.lastProviderText = sent.message ?? normalized;
       }
       target.lastSentText = normalized;
       return true;
     } catch (err) {
+      // Stop immediately so a discarded background failure cannot queue a second visible post.
       streamState.stopped = true;
+      const acceptedDeliveryError = isChannelPartialDeliveryError(err)
+        ? toErrorObject(err, "Mattermost accepted delivery failed")
+        : undefined;
+      if (acceptedDeliveryError) {
+        // Warning handlers can synchronously re-enter finalization; retain the failure first.
+        terminalAcceptedDeliveryError = acceptedDeliveryError;
+      }
       params.warn?.(
         `mattermost stream preview failed: ${err instanceof Error ? err.message : String(err)}`,
       );
+      if (acceptedDeliveryError) {
+        throw acceptedDeliveryError;
+      }
       return false;
     }
   };
@@ -216,6 +227,9 @@ export function createMattermostDraftStream(params: {
   });
 
   const forceNewMessage = () => {
+    if (terminalAcceptedDeliveryError !== undefined) {
+      return Promise.reject(terminalAcceptedDeliveryError);
+    }
     if (streamState.stopped || streamState.final) {
       return Promise.resolve();
     }
@@ -226,11 +240,23 @@ export function createMattermostDraftStream(params: {
     const sealed = currentGeneration;
     const assistantText = sealed.latestAssistantText?.trim();
     let publishedAssistantOffset = 0;
+    const recordPublishedAssistantPart = (messageId: string, content: string, offset: number) => {
+      if (!assistantText) {
+        return;
+      }
+      publishedAssistantParts.set(messageId, { messageId, content });
+      publishedAssistantOffset =
+        consumeMattermostPublishedChunk({ source: assistantText, offset, chunk: content }) ??
+        offset;
+    };
     const boundary = (async () => {
       try {
         await sealed.ready;
+        assertNoAcceptedDeliveryFailure();
         await inFlightAtBoundary;
+        assertNoAcceptedDeliveryFailure();
         if (streamState.stopped && !streamState.final) {
+          assertNoAcceptedDeliveryFailure();
           return;
         }
         const sourceText = pendingText.trim() ? pendingText : sealed.latestSourceText;
@@ -247,16 +273,7 @@ export function createMattermostDraftStream(params: {
           if (assistantText && (sealed.lastProviderText || sealed.lastSentText)) {
             const publishedContent = sealed.lastProviderText ?? sealed.lastSentText;
             // The existing preview remains visible if its lossless boundary edit fails.
-            trackPublishedAssistantPart({
-              messageId: sealed.postId,
-              content: publishedContent,
-            });
-            publishedAssistantOffset =
-              consumeMattermostPublishedChunk({
-                source: assistantText,
-                offset: 0,
-                chunk: publishedContent,
-              }) ?? 0;
+            recordPublishedAssistantPart(sealed.postId, publishedContent, 0);
           }
           let providerFirstChunk = sealed.lastProviderText ?? firstChunk;
           if (firstChunk !== sealed.lastSentText) {
@@ -265,41 +282,14 @@ export function createMattermostDraftStream(params: {
             });
             providerFirstChunk = updated.message ?? firstChunk;
           }
-          if (assistantText) {
-            trackPublishedAssistantPart({
-              messageId: sealed.postId,
-              content: providerFirstChunk,
-            });
-            publishedAssistantOffset =
-              consumeMattermostPublishedChunk({
-                source: assistantText,
-                offset: 0,
-                chunk: providerFirstChunk,
-              }) ?? 0;
-          }
+          recordPublishedAssistantPart(sealed.postId, providerFirstChunk, 0);
         } else {
           const firstPost = await createMattermostPost(params.client, {
             channelId: params.channelId,
             message: firstChunk,
             rootId: params.rootId,
           });
-          const firstPostId = firstPost.id?.trim();
-          if (!firstPostId) {
-            throw new Error("missing post id from boundary create");
-          }
-          if (assistantText) {
-            const publishedContent = firstPost.message ?? firstChunk;
-            trackPublishedAssistantPart({
-              messageId: firstPostId,
-              content: publishedContent,
-            });
-            publishedAssistantOffset =
-              consumeMattermostPublishedChunk({
-                source: assistantText,
-                offset: 0,
-                chunk: publishedContent,
-              }) ?? 0;
-          }
+          recordPublishedAssistantPart(firstPost.id, firstPost.message ?? firstChunk, 0);
         }
         for (const chunk of chunks.slice(1)) {
           const post = await createMattermostPost(params.client, {
@@ -307,25 +297,20 @@ export function createMattermostDraftStream(params: {
             message: chunk,
             rootId: params.rootId,
           });
-          const postId = post.id?.trim();
-          if (!postId) {
-            throw new Error("missing post id from boundary create");
-          }
-          if (assistantText) {
-            const publishedContent = post.message ?? chunk;
-            trackPublishedAssistantPart({ messageId: postId, content: publishedContent });
-            publishedAssistantOffset =
-              consumeMattermostPublishedChunk({
-                source: assistantText,
-                offset: publishedAssistantOffset,
-                chunk: publishedContent,
-              }) ?? publishedAssistantOffset;
-          }
+          recordPublishedAssistantPart(post.id, post.message ?? chunk, publishedAssistantOffset);
         }
         if (assistantText) {
           sealedAssistantTexts.push({ text: assistantText, requiresBlockBoundary: true });
         }
       } catch (err) {
+        const acceptedDeliveryError = isChannelPartialDeliveryError(err)
+          ? toErrorObject(err, "Mattermost accepted delivery failed")
+          : undefined;
+        if (acceptedDeliveryError) {
+          // Publish terminal state before warning hooks can re-enter update or forceNewMessage.
+          streamState.stopped = true;
+          terminalAcceptedDeliveryError = acceptedDeliveryError;
+        }
         const publishedAssistantPrefix = assistantText?.slice(0, publishedAssistantOffset).trim();
         if (publishedAssistantPrefix) {
           // A later physical chunk failed after this exact source prefix became durable.
@@ -338,6 +323,9 @@ export function createMattermostDraftStream(params: {
         params.warn?.(
           `mattermost stream preview boundary flush failed: ${err instanceof Error ? err.message : String(err)}`,
         );
+        if (acceptedDeliveryError) {
+          throw acceptedDeliveryError;
+        }
       }
     })();
     currentGeneration = {
@@ -350,23 +338,57 @@ export function createMattermostDraftStream(params: {
   };
 
   const flush = async () => {
+    assertNoAcceptedDeliveryFailure();
     await loop.flush();
     await currentGeneration.ready;
+    assertNoAcceptedDeliveryFailure();
   };
   const discardPending = async () => {
+    assertNoAcceptedDeliveryFailure();
     await stopForClear();
     await currentGeneration.ready;
+    assertNoAcceptedDeliveryFailure();
   };
   const clear = async () => {
+    assertNoAcceptedDeliveryFailure();
     await clearWithStop(discardPending);
+    assertNoAcceptedDeliveryFailure();
+  };
+  const deleteCurrentMessage = async () => {
+    assertNoAcceptedDeliveryFailure();
+    const retiring = currentGeneration;
+    loop.resetPending();
+    const inFlight = loop.waitForInFlight();
+    const retirement = clearWithStop(
+      async () => {
+        await retiring.ready;
+        await inFlight;
+        assertNoAcceptedDeliveryFailure();
+      },
+      {
+        readMessageId: () => retiring.postId,
+        clearMessageId: () => {
+          retiring.postId = undefined;
+        },
+      },
+    );
+    // Claim retirement before yielding; replacement sends wait without reusing the deleted post.
+    currentGeneration = { lastSentText: "", latestSourceText: "", ready: retirement };
+    loop.resetThrottleWindow();
+    await retirement;
+    assertNoAcceptedDeliveryFailure();
   };
   const seal = async () => {
+    assertNoAcceptedDeliveryFailure();
     await sealLifecycle();
     await currentGeneration.ready;
+    assertNoAcceptedDeliveryFailure();
   };
   const stop = async () => {
+    assertNoAcceptedDeliveryFailure();
     await stopLifecycle();
     await currentGeneration.ready;
+    assertNoAcceptedDeliveryFailure();
   };
   const update = (text: string) => {
     currentGeneration.latestSourceText = text;
@@ -379,7 +401,9 @@ export function createMattermostDraftStream(params: {
     updateLifecycle(text);
   };
   const settleBoundaries = async () => {
+    assertNoAcceptedDeliveryFailure();
     await currentGeneration.ready;
+    assertNoAcceptedDeliveryFailure();
   };
   const resolveFinalText = (text: string) => {
     const publishedParts = [...publishedAssistantParts.values()];
@@ -419,6 +443,7 @@ export function createMattermostDraftStream(params: {
     flush,
     postId: () => currentGeneration.postId,
     clear,
+    deleteCurrentMessage,
     discardPending,
     seal,
     stop,

@@ -1,11 +1,15 @@
 // Legacy config migration bridge for channel doctor compatibility contracts.
+
+import { isChannelConfigMetadataKey } from "../../../channels/config-metadata.js";
 import { getBootstrapChannelPlugin } from "../../../channels/plugins/bootstrap-registry.js";
 import { loadBundledChannelDoctorContractApi } from "../../../channels/plugins/doctor-contract-api.js";
 import type { OpenClawConfig } from "../../../config/types.js";
 import {
   applyPluginDoctorCompatibilityMigrations,
-  collectRelevantDoctorPluginIds,
+  collectDoctorConfigRepairPluginIds,
+  isPluginDoctorMigrationDeferred,
 } from "../../../plugins/doctor-contract-registry.js";
+import { listDoctorConfiguredChannelIds } from "./configured-channel-ids.js";
 import { isRecord } from "./legacy-config-record-shared.js";
 
 type ChannelDoctorCompatibilityMutation = {
@@ -16,16 +20,6 @@ type ChannelDoctorCompatibilityMutation = {
 type ChannelDoctorCompatibilityNormalizer = (params: {
   cfg: OpenClawConfig;
 }) => ChannelDoctorCompatibilityMutation;
-
-function collectRelevantDoctorChannelIds(raw: unknown): string[] {
-  const channels = isRecord(raw) && isRecord(raw.channels) ? raw.channels : null;
-  if (!channels) {
-    return [];
-  }
-  return Object.keys(channels)
-    .filter((channelId) => channelId !== "defaults")
-    .toSorted();
-}
 
 function migrateHeartbeatVisibility(raw: Record<string, unknown>, changes: string[]): void {
   const channels = isRecord(raw.channels) ? raw.channels : null;
@@ -59,7 +53,7 @@ function migrateHeartbeatVisibility(raw: Record<string, unknown>, changes: strin
     migrateEntry(defaults, "channels.defaults");
   }
   for (const [channelId, value] of Object.entries(channels)) {
-    if (channelId === "defaults" || !isRecord(value)) {
+    if (!channelId.trim() || isChannelConfigMetadataKey(channelId) || !isRecord(value)) {
       continue;
     }
     const preserveEmptyPluginBlock = channelId === "feishu";
@@ -83,6 +77,9 @@ function migrateHeartbeatVisibility(raw: Record<string, unknown>, changes: strin
 function resolveBundledChannelCompatibilityNormalizer(
   channelId: string,
 ): ChannelDoctorCompatibilityNormalizer | undefined {
+  if (isPluginDoctorMigrationDeferred(channelId)) {
+    return undefined;
+  }
   const contractNormalizer =
     loadBundledChannelDoctorContractApi(channelId)?.normalizeCompatibilityConfig;
   if (typeof contractNormalizer === "function") {
@@ -99,7 +96,7 @@ function collectPluginDoctorCompatibilityIds(params: {
   return [
     ...new Set([
       ...params.unresolvedChannelIds,
-      ...collectRelevantDoctorPluginIds(params.raw).filter(
+      ...collectDoctorConfigRepairPluginIds(params.raw).filter(
         (pluginId) => !unresolvedChannelIds.has(pluginId),
       ),
     ]),
@@ -107,7 +104,10 @@ function collectPluginDoctorCompatibilityIds(params: {
 }
 
 /** Apply bundled and plugin channel compatibility migrations to a legacy config object. */
-export function applyChannelDoctorCompatibilityMigrations(cfg: Record<string, unknown>): {
+export function applyChannelDoctorCompatibilityMigrations(
+  cfg: Record<string, unknown>,
+  options?: { pluginContracts?: boolean },
+): {
   next: Record<string, unknown>;
   changes: string[];
 } {
@@ -116,7 +116,10 @@ export function applyChannelDoctorCompatibilityMigrations(cfg: Record<string, un
   migrateHeartbeatVisibility(cfg, changes);
   const unresolvedChannelIds: string[] = [];
 
-  for (const channelId of collectRelevantDoctorChannelIds(cfg)) {
+  for (const channelId of listDoctorConfiguredChannelIds(cfg, {
+    configEntryPolicy: "raw",
+    sort: "codepoint",
+  })) {
     const normalizeCompatibilityConfig = resolveBundledChannelCompatibilityNormalizer(channelId);
     if (!normalizeCompatibilityConfig) {
       unresolvedChannelIds.push(channelId);
@@ -130,7 +133,12 @@ export function applyChannelDoctorCompatibilityMigrations(cfg: Record<string, un
     changes.push(...mutation.changes);
   }
 
-  const pluginIds = collectPluginDoctorCompatibilityIds({ raw: cfg, unresolvedChannelIds });
+  // Plugin id collection loads the installed-plugin registry from the shared state
+  // database; state-free preview callers opt out and rely on the full committer run.
+  const pluginIds =
+    options?.pluginContracts === false
+      ? []
+      : collectPluginDoctorCompatibilityIds({ raw: cfg, unresolvedChannelIds });
   if (pluginIds.length > 0) {
     const compat = applyPluginDoctorCompatibilityMigrations(nextCfg, {
       config: cfg as OpenClawConfig,

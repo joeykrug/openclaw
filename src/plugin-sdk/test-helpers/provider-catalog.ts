@@ -8,10 +8,6 @@ export {
   expectCodexMissingAuthHint,
 } from "../../plugins/provider-runtime.test-support.js";
 export type { ProviderPlugin } from "../provider-model-shared.js";
-export {
-  loadBundledPluginPublicSurface,
-  loadBundledPluginPublicSurfaceSync,
-} from "./public-surface-loader.js";
 
 type ProviderRuntimeCatalogModule = Pick<
   typeof import("openclaw/plugin-sdk/provider-catalog-runtime"),

@@ -1,19 +1,40 @@
 // Control UI helpers shared by config form node renderers.
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { html, nothing, type TemplateResult } from "lit";
+import { ref } from "lit/directives/ref.js";
+import { isSensitiveConfigPath } from "../../../src/config/sensitive-paths.js";
 import type { ConfigUiHints } from "../api/types.ts";
 import { icons } from "../components/icons.ts";
-import "../components/tooltip.ts";
 import { t } from "../i18n/index.ts";
+import "../components/tooltip.ts";
+import { REDACTED_SENTINEL } from "../lib/config-form-utils.ts";
 import { formatUnknownText } from "../lib/format.ts";
+import { configValuesEqual, isSupportedConfigValueValid } from "./config-form.constraints.ts";
+import { formatConfigFormNumber } from "./config-form.numeric.ts";
 import type { ConfigSearchCriteria } from "./config-form.search.ts";
 import {
+  configFieldId,
   hasSensitiveConfigData,
+  hintForPath,
+  pathKey as configPathKey,
   redactedPlaceholder,
   type JsonSchema,
 } from "./config-form.shared.ts";
 import { renderSettingsSegmented } from "./settings-ui.ts";
 
-const META_KEYS = new Set(["title", "description", "default", "nullable", "tags", "x-tags"]);
+const META_KEYS = new Set([
+  "title",
+  "description",
+  "default",
+  "nullable",
+  "enumIncludesNull",
+  "tags",
+  "x-tags",
+]);
+const jsonTextareaState = new WeakMap<
+  HTMLTextAreaElement,
+  { sourceValue: unknown; fallback: string; pathKey: string }
+>();
 
 export type ConfigNodeRenderParams = {
   schema: JsonSchema;
@@ -23,12 +44,20 @@ export type ConfigNodeRenderParams = {
   rawAvailable?: boolean;
   unsupported: Set<string>;
   disabled: boolean;
+  isRequired?: boolean;
+  sourceIdentity?: unknown;
+  controlIdentity?: unknown;
+  structuredDraftOwner?: boolean;
   showLabel?: boolean;
+  /** Section shells own the title while collection rows still own help/default metadata. */
+  showHeaderMeta?: boolean;
   searchCriteria?: ConfigSearchCriteria;
   revealSensitive?: boolean;
+  maskSensitive?: boolean;
   isSensitivePathRevealed?: (path: Array<string | number>) => boolean;
   onToggleSensitivePath?: (path: Array<string | number>) => void;
-  onPatch: (path: Array<string | number>, value: unknown) => void;
+  onPatch: (path: Array<string | number>, value: unknown) => boolean | void;
+  onRemove?: (path: Array<string | number>) => boolean | void;
 };
 
 export type ConfigNodeRenderer = (
@@ -37,9 +66,11 @@ export type ConfigNodeRenderer = (
 
 type SensitiveRenderState = {
   isSensitive: boolean;
+  isMasked: boolean;
   isRedacted: boolean;
   isRevealed: boolean;
   canReveal: boolean;
+  sentinelRedacted: boolean;
 };
 
 export function isAnySchema(schema: JsonSchema): boolean {
@@ -58,25 +89,12 @@ export function jsonValue(value: unknown): string {
   }
 }
 
-function formatComparablePrimitive(value: unknown): string | null {
-  if (
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean" ||
-    typeof value === "bigint"
-  ) {
-    return String(value);
-  }
-  return null;
+export function formatConfigValueText(value: unknown): string {
+  return typeof value === "number" ? formatConfigFormNumber(value) : formatUnknownText(value);
 }
 
-function matchesComparablePrimitiveValue(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) {
-    return true;
-  }
-  const leftComparable = formatComparablePrimitive(left);
-  const rightComparable = formatComparablePrimitive(right);
-  return leftComparable !== null && leftComparable === rightComparable;
+export function schemaWithDefault(schema: JsonSchema, value: unknown): JsonSchema {
+  return { ...schema, default: value };
 }
 
 export function isSecretRefObject(value: unknown): value is {
@@ -84,7 +102,7 @@ export function isSecretRefObject(value: unknown): value is {
   id: string;
   provider?: string;
 } {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
+  if (!isRecord(value)) {
     return false;
   }
   const candidate = value as Record<string, unknown>;
@@ -98,18 +116,33 @@ export function getSensitiveRenderState(params: {
   path: Array<string | number>;
   value: unknown;
   hints: ConfigUiHints;
-  revealSensitive: boolean;
+  revealSensitive?: boolean;
+  maskSensitive?: boolean;
   isSensitivePathRevealed?: (path: Array<string | number>) => boolean;
 }): SensitiveRenderState {
   const isSensitive = hasSensitiveConfigData(params.value, params.path, params.hints);
+  // The server never sends plaintext secrets: a stored secret arrives as the
+  // redaction sentinel. Revealing it would display the sentinel as an editable
+  // value; any edit then overwrites the real credential with mangled text.
+  const sentinel = params.value === REDACTED_SENTINEL;
   const isRevealed =
     isSensitive &&
+    !sentinel &&
     (params.revealSensitive || (params.isSensitivePathRevealed?.(params.path) ?? false));
   return {
     isSensitive,
+    isMasked:
+      params.maskSensitive === true &&
+      !params.revealSensitive &&
+      !isRevealed &&
+      (params.value === undefined || typeof params.value === "string") &&
+      (hintForPath(params.path, params.hints)?.sensitive ||
+        isSensitiveConfigPath(configPathKey(params.path)) ||
+        isSensitive),
     isRedacted: isSensitive && !isRevealed,
     isRevealed,
-    canReveal: isSensitive,
+    canReveal: isSensitive && !sentinel,
+    sentinelRedacted: sentinel,
   };
 }
 
@@ -127,7 +160,9 @@ export function renderSensitiveToggleButton(params: {
     ? state.isRevealed
       ? t("configForm.hideValue")
       : t("configForm.revealValue")
-    : t("configForm.disableStreamToReveal");
+    : state.sentinelRedacted
+      ? t("configForm.storedSecretNotRevealable")
+      : t("configForm.disableStreamToReveal");
   return html`
     <openclaw-tooltip .content=${label}>
       <button
@@ -171,6 +206,8 @@ export function renderTags(tags: string[]): TemplateResult | typeof nothing {
 export function renderFieldRow(params: {
   label: unknown;
   help?: unknown;
+  helpId?: string;
+  defaultDescription?: unknown;
   tags: string[];
   showLabel: boolean;
   control: TemplateResult | typeof nothing;
@@ -181,32 +218,82 @@ export function renderFieldRow(params: {
   // wildcard segments collapse), so their help is the parent's. Showing it again
   // per item is noise; a row with no label of its own gets no help of its own.
   const help = params.showLabel ? params.help : undefined;
+  const defaultDescription = params.showLabel ? params.defaultDescription : undefined;
   const hasText =
-    params.showLabel || Boolean(help) || params.tags.length > 0 || Boolean(params.error);
+    params.showLabel ||
+    Boolean(help) ||
+    Boolean(defaultDescription) ||
+    params.tags.length > 0 ||
+    Boolean(params.error);
   // Control-only rows (array/map item values) stack so the control gets full width.
   const stacked = params.stacked || !hasText;
   const className = stacked ? "settings-row settings-row--stacked" : "settings-row";
   return html`
     <div class=${className}>
-      ${hasText
-        ? html`
-            <div class="settings-row__text">
-              ${params.showLabel
-                ? html`<span class="settings-row__title">${params.label}</span>`
-                : nothing}
-              ${help ? html`<span class="settings-row__desc">${help}</span>` : nothing}
-              ${renderTags(params.tags)}
-              ${params.error
-                ? html`<span class="cfg-field__error">${params.error}</span>`
-                : nothing}
-            </div>
-          `
-        : nothing}
-      ${params.control !== nothing
-        ? html`<div class="settings-row__control">${params.control}</div>`
-        : nothing}
+      ${
+        hasText
+          ? html`
+              <div class="settings-row__text">
+                ${
+                  params.showLabel
+                    ? html`<span class="settings-row__title">${params.label}</span>`
+                    : nothing
+                }
+                ${
+                  help
+                    ? html`<span class="settings-row__desc" id=${params.helpId ?? nothing}
+                        >${help}</span
+                      >`
+                    : nothing
+                }
+                ${
+                  defaultDescription
+                    ? html`<span class="settings-row__desc">${defaultDescription}</span>`
+                    : nothing
+                }
+                ${renderTags(params.tags)}
+                ${
+                  params.error
+                    ? html`<span class="cfg-field__error" role="alert">${params.error}</span>`
+                    : nothing
+                }
+              </div>
+            `
+          : nothing
+      }
+      ${
+        params.control !== nothing
+          ? html`<div class="settings-row__control">${params.control}</div>`
+          : nothing
+      }
     </div>
   `;
+}
+
+export function renderCollectionDefaultDescription(
+  params: ConfigNodeRenderParams,
+  effectiveValue: unknown,
+): TemplateResult | typeof nothing {
+  const redacted = getSensitiveRenderState({
+    path: params.path,
+    value: effectiveValue,
+    hints: params.hints,
+    revealSensitive: params.revealSensitive ?? false,
+    isSensitivePathRevealed: params.isSensitivePathRevealed,
+  }).isRedacted;
+  return redacted ? nothing : renderSchemaDefaultDescription(params.schema, params.value);
+}
+
+export function renderSchemaDefaultDescription(
+  schema: JsonSchema,
+  value: unknown,
+): TemplateResult | typeof nothing {
+  if (schema.default === undefined) {
+    return nothing;
+  }
+  return html`${t(value === undefined ? "configForm.usingDefault" : "configForm.defaultValue", {
+    value: formatConfigValueText(schema.default),
+  })}`;
 }
 
 export function renderSegmentedControl(params: {
@@ -214,44 +301,130 @@ export function renderSegmentedControl(params: {
   resolvedValue: unknown;
   disabled: boolean;
   ariaLabel: string;
-  onSelect: (value: unknown) => void;
+  onSelect: (value: unknown) => boolean | void;
 }): TemplateResult {
   const selectedIndex = params.options.findIndex((option) =>
-    matchesComparablePrimitiveValue(option, params.resolvedValue),
+    configValuesEqual(option, params.resolvedValue),
   );
   return renderSettingsSegmented({
     value: selectedIndex < 0 ? "" : String(selectedIndex),
     options: params.options.map((option, index) => ({
       value: String(index),
-      label: formatUnknownText(option),
+      label: configEnumOptionLabel(option, params.options),
     })),
     disabled: params.disabled,
     ariaLabel: params.ariaLabel,
     onChange: (index) => {
       const option = params.options[Number(index)];
       if (option !== undefined) {
-        params.onSelect(option);
+        return params.onSelect(option);
       }
     },
   });
 }
 
+export function configEnumOptionLabel(option: unknown, options: readonly unknown[]): string {
+  const presentsBooleanState = options.includes(true) && options.includes(false);
+  if (!presentsBooleanState) {
+    return formatConfigValueText(option);
+  }
+  if (option === true) {
+    return t("configForm.enumOn");
+  }
+  if (option === false) {
+    return t("configForm.enumOff");
+  }
+  return option === "auto" ? t("configForm.enumAuto") : formatConfigValueText(option);
+}
+
 export function renderJsonTextareaControl(params: {
+  schema: JsonSchema;
   path: Array<string | number>;
+  ariaLabel: string;
+  descriptionId?: string;
+  sourceValue: unknown;
   fallback: string;
   rows: number;
   sensitiveState: SensitiveRenderState;
   disabled: boolean;
+  isRequired?: boolean;
   onToggleSensitivePath?: (path: Array<string | number>) => void;
-  onPatch: (path: Array<string | number>, value: unknown) => void;
+  onPatch: (path: Array<string | number>, value: unknown) => boolean | void;
 }): TemplateResult {
   const { path, fallback, sensitiveState, disabled, onPatch } = params;
+  const errorId = configFieldId(path, "json-error");
+  const describedBy = [params.descriptionId, errorId].filter(Boolean).join(" ");
+  const setValidity = (target: HTMLTextAreaElement, message: string) => {
+    const error = target
+      .closest(".cfg-json-editor")
+      ?.querySelector<HTMLElement>(".cfg-field__error");
+    target.setCustomValidity(message);
+    target.setAttribute("aria-invalid", String(Boolean(message)));
+    if (error) {
+      error.hidden = !message;
+      error.textContent = message;
+    }
+  };
+  const updateValidity = (target: HTMLTextAreaElement) => {
+    let message = "";
+    const raw = target.value.trim();
+    if (!raw && params.isRequired) {
+      message = t("configForm.invalidJson");
+    } else if (raw) {
+      try {
+        if (!isSupportedConfigValueValid(params.schema, JSON.parse(raw))) {
+          message = t("configForm.invalidJson");
+        }
+      } catch {
+        message = t("configForm.invalidJson");
+      }
+    }
+    setValidity(target, message);
+    return !message;
+  };
+  const renderedFallback = sensitiveState.isRedacted ? "" : fallback;
+  const pathKey = JSON.stringify(path.filter((segment) => typeof segment === "string"));
+  const commitJsonValue = (target: HTMLTextAreaElement, candidate: unknown) => {
+    if (onPatch(path, candidate) !== false) {
+      return true;
+    }
+    target.value = renderedFallback;
+    updateValidity(target);
+    return false;
+  };
   const textareaControl = html`
     <textarea
+      ${ref((element) => {
+        if (!(element instanceof HTMLTextAreaElement)) {
+          return;
+        }
+        const previous = jsonTextareaState.get(element);
+        if (
+          previous &&
+          // Content equality for the value: an autosave ack clones the form,
+          // so identity churn with identical bytes must not erase in-progress
+          // (possibly not-yet-valid) JSON the operator is typing.
+          ((!Object.is(previous.sourceValue, params.sourceValue) &&
+            !configValuesEqual(previous.sourceValue, params.sourceValue)) ||
+            previous.fallback !== renderedFallback ||
+            previous.pathKey !== pathKey)
+        ) {
+          element.value = renderedFallback;
+          setValidity(element, "");
+        }
+        jsonTextareaState.set(element, {
+          sourceValue: params.sourceValue,
+          fallback: renderedFallback,
+          pathKey,
+        });
+      })}
       class="settings-input${sensitiveState.isRedacted ? " cfg-redacted" : ""}"
+      aria-label=${params.ariaLabel}
+      aria-describedby=${describedBy || nothing}
+      aria-invalid="false"
       placeholder=${sensitiveState.isRedacted ? redactedPlaceholder() : t("configForm.jsonValue")}
       rows=${params.rows}
-      .value=${sensitiveState.isRedacted ? "" : fallback}
+      .value=${renderedFallback}
       ?disabled=${disabled}
       ?readonly=${sensitiveState.isRedacted}
       @click=${() => {
@@ -259,31 +432,44 @@ export function renderJsonTextareaControl(params: {
           params.onToggleSensitivePath(path);
         }
       }}
+      @input=${(event: Event) => {
+        if (!sensitiveState.isRedacted) {
+          updateValidity(event.target as HTMLTextAreaElement);
+        }
+      }}
       @change=${(event: Event) => {
         if (sensitiveState.isRedacted) {
           return;
         }
         const target = event.target as HTMLTextAreaElement;
+        if (!updateValidity(target)) {
+          return;
+        }
         const raw = target.value.trim();
         if (!raw) {
-          onPatch(path, undefined);
+          commitJsonValue(target, undefined);
           return;
         }
         try {
-          onPatch(path, JSON.parse(raw));
+          commitJsonValue(target, JSON.parse(raw));
         } catch {
-          target.value = fallback;
+          // Input validity is already surfaced inline; preserve the draft until it is valid JSON.
         }
       }}
     ></textarea>
   `;
-  return wrapSensitiveControl(
-    textareaControl,
-    renderSensitiveToggleButton({
-      path,
-      state: sensitiveState,
-      disabled,
-      onToggleSensitivePath: params.onToggleSensitivePath,
-    }),
-  );
+  return html`
+    <span class="cfg-json-editor">
+      ${wrapSensitiveControl(
+        textareaControl,
+        renderSensitiveToggleButton({
+          path,
+          state: sensitiveState,
+          disabled,
+          onToggleSensitivePath: params.onToggleSensitivePath,
+        }),
+      )}
+      <span id=${errorId} class="cfg-field__error" role="alert" hidden></span>
+    </span>
+  `;
 }

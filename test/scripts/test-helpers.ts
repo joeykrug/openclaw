@@ -4,6 +4,29 @@ import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach } from "vitest";
+import { cleanupTempDirs } from "../helpers/temp-dir.js";
+
+export function linkPnpmBootstrapShellTools(binDir: string): void {
+  // Omit package managers: absence must not depend on the host's installed tools.
+  for (const name of [
+    "bash",
+    "cp",
+    "date",
+    "dirname",
+    "env",
+    "grep",
+    "head",
+    "mkdir",
+    "mktemp",
+    "rm",
+  ]) {
+    const binary = ["/usr/bin", "/bin"].map((dir) => path.join(dir, name)).find(fs.existsSync);
+    if (!binary) {
+      throw new Error(`Missing system shell fixture tool: ${name}`);
+    }
+    fs.symlinkSync(binary, path.join(binDir, name));
+  }
+}
 
 export function writeNodeBackedJq(binDir: string): void {
   const jqPath = path.join(binDir, "jq");
@@ -46,29 +69,18 @@ else if (query.includes("{id: .profileId")) {
 export function createScriptTestHarness() {
   const tempDirs: string[] = [];
 
-  afterEach(() => {
-    while (tempDirs.length > 0) {
-      const dir = tempDirs.pop();
-      if (dir) {
-        fs.rmSync(dir, { recursive: true, force: true });
-      }
-    }
-  });
+  afterEach(() => cleanupTempDirs(tempDirs));
 
   function createTempDir(prefix: string): string {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-    tempDirs.push(dir);
-    return dir;
+    return trackTempDir(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   }
 
   async function createTempDirAsync(prefix: string): Promise<string> {
-    const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), prefix));
-    tempDirs.push(dir);
-    return dir;
+    return trackTempDir(await fsPromises.mkdtemp(path.join(os.tmpdir(), prefix)));
   }
 
   function trackTempDir(dir: string): string {
-    tempDirs.push(dir);
+    tempDirs.unshift(dir);
     return dir;
   }
 

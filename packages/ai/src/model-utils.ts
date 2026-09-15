@@ -1,21 +1,15 @@
 // Provides model selection, usage, and thinking-level utility helpers.
 import {
+  calculateUsageCost,
   resolveClaudeNativeThinkingLevelMap,
   requiresClaudeMandatoryAdaptiveThinking,
 } from "@openclaw/llm-core";
+import { resolveOpenAIModelReasoningEfforts } from "./providers/openai-reasoning-effort.js";
 import type { Api, Model, ModelThinkingLevel, Usage } from "./types.js";
 
 /** Calculates and stores model cost fields from token usage and per-million pricing. */
 export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage): Usage["cost"] {
-  const cacheWrite1h = Math.min(usage.cacheWrite, Math.max(0, usage.cacheWrite1h ?? 0));
-  const cacheWrite5m = usage.cacheWrite - cacheWrite1h;
-  usage.cost.input = (model.cost.input / 1000000) * usage.input;
-  usage.cost.output = (model.cost.output / 1000000) * usage.output;
-  usage.cost.cacheRead = (model.cost.cacheRead / 1000000) * usage.cacheRead;
-  usage.cost.cacheWrite =
-    (model.cost.cacheWrite * cacheWrite5m + model.cost.input * 2 * cacheWrite1h) / 1000000;
-  usage.cost.total =
-    usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+  Object.assign(usage.cost, calculateUsageCost(usage, model.cost));
   return usage.cost;
 }
 
@@ -54,6 +48,13 @@ export function getSupportedThinkingLevels<TApi extends Api>(
     return ["off"];
   }
   const thinkingLevelMap = resolveThinkingLevelMap(model);
+  const reasoningEfforts =
+    model.api === "openai-completions" ||
+    model.api === "openai-responses" ||
+    model.api === "azure-openai-responses" ||
+    model.api === "openai-chatgpt-responses"
+      ? resolveOpenAIModelReasoningEfforts(model)
+      : undefined;
 
   return EXTENDED_THINKING_LEVELS.filter((level) => {
     const mapped = thinkingLevelMap?.[level];
@@ -61,7 +62,7 @@ export function getSupportedThinkingLevels<TApi extends Api>(
       return false;
     }
     if (level === "xhigh" || level === "max") {
-      return mapped !== undefined;
+      return mapped !== undefined || reasoningEfforts?.includes(level) === true;
     }
     return true;
   });

@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from "vitest";
+import { createDeferred as deferred } from "../../../test/helpers/promise.js";
 import { createCanvasSurfaceLease } from "./canvas-surface-lease.runtime.ts";
 
 type ScheduledTimer = {
@@ -68,14 +69,6 @@ async function flushPromises() {
   for (let index = 0; index < 10; index += 1) {
     await Promise.resolve();
   }
-}
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((nextResolve) => {
-    resolve = nextResolve;
-  });
-  return { promise, resolve };
 }
 
 function createLeaseHarness(request: (method: string, params: unknown) => Promise<unknown>) {
@@ -184,6 +177,96 @@ describe("createCanvasSurfaceLease", () => {
     expect(changes.at(-1)).toBe("https://canvas.test/__openclaw__/cap/fresh");
     expect(clock.nextDelayMs).toBe(60_000);
   });
+
+  it.each(["stops", "reconnects without a canvas"] as const)(
+    "does not schedule a retired generation when publishing a refreshed URL %s",
+    async (transition) => {
+      const clock = new FakeClock();
+      const changes: Array<string | null> = [];
+      const request = vi.fn(async () => ({
+        surface: "canvas",
+        pluginSurfaceUrls: { canvas: "https://canvas.test/__openclaw__/cap/refreshed" },
+        expiresAtMs: 120_000,
+      }));
+      const lease = createCanvasSurfaceLease({
+        request,
+        onChange: (url) => {
+          changes.push(url);
+          if (url === "https://canvas.test/__openclaw__/cap/refreshed") {
+            if (transition === "stops") {
+              lease.stop();
+            } else {
+              lease.start(undefined);
+            }
+          }
+        },
+        now: clock.now,
+        setTimer: clock.setTimer,
+        clearTimer: clock.clearTimer,
+      });
+
+      lease.start("https://canvas.test/__openclaw__/cap/original");
+      await flushPromises();
+
+      expect(request).toHaveBeenCalledOnce();
+      expect(changes).toEqual([
+        "https://canvas.test/__openclaw__/cap/original",
+        "https://canvas.test/__openclaw__/cap/refreshed",
+        null,
+      ]);
+      expect(clock.pendingCount).toBe(0);
+    },
+  );
+
+  it("keeps the reconnect renewal owned when a retired timer callback arrives late", async () => {
+    const request = vi
+      .fn<(method: string, params: unknown) => Promise<unknown>>()
+      .mockResolvedValueOnce({
+        surface: "canvas",
+        pluginSurfaceUrls: { canvas: "https://canvas.test/__openclaw__/cap/first" },
+        expiresAtMs: 120_000,
+      })
+      .mockResolvedValueOnce({
+        surface: "canvas",
+        pluginSurfaceUrls: { canvas: "https://canvas.test/__openclaw__/cap/reconnected" },
+        expiresAtMs: 180_000,
+      });
+    const { clock, lease } = createLeaseHarness(request);
+
+    lease.start("https://canvas.test/__openclaw__/cap/original");
+    await flushPromises();
+    const retiredCallback = clock.takeNextCallback();
+    expect(retiredCallback).toBeDefined();
+
+    lease.stop();
+    lease.start("https://canvas.test/__openclaw__/cap/reconnect");
+    await flushPromises();
+    expect(clock.pendingCount).toBe(1);
+
+    retiredCallback?.();
+    expect(request).toHaveBeenCalledTimes(2);
+    lease.stop();
+
+    expect(clock.pendingCount).toBe(0);
+  });
+
+  it.each([Number.MAX_SAFE_INTEGER, 2 ** 32 + 115_000])(
+    "clamps an advertised canvas expiry of %d to a browser-safe native timer",
+    async (expiresAtMs) => {
+      const request = vi.fn(async () => ({
+        surface: "canvas",
+        pluginSurfaceUrls: { canvas: "https://canvas.test/__openclaw__/cap/refreshed" },
+        expiresAtMs,
+      }));
+      const { clock, lease } = createLeaseHarness(request);
+
+      lease.start("https://canvas.test/__openclaw__/cap/original");
+      await flushPromises();
+
+      expect(clock.nextDelayMs).toBe(2_147_483_647);
+      lease.stop();
+    },
+  );
 
   it("stop clears timers, ignores an in-flight result, and publishes null once", async () => {
     const pending = deferred<unknown>();

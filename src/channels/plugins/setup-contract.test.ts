@@ -1,7 +1,74 @@
 import { describe, expect, it, vi } from "vitest";
-import { defineChannelSetupContract } from "./setup-contract.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { createPluginCache, withPluginCache } from "../../plugins/plugin-cache.js";
+import {
+  defineChannelSetupContract,
+  resolveChannelSetupExecutionAdapter,
+} from "./setup-contract.js";
+import { moveSingleAccountChannelSectionToDefaultAccount } from "./setup-helpers.js";
 
 describe("defineChannelSetupContract", () => {
+  it("keeps released adapters intact while preferring channel-owned contracts", () => {
+    const setup = { applyAccountConfig: ({ cfg }: { cfg: OpenClawConfig }) => cfg };
+    const setupContract = defineChannelSetupContract({ fields: {}, adapter: setup });
+
+    expect(resolveChannelSetupExecutionAdapter({ setup })).toBe(setup);
+    expect(resolveChannelSetupExecutionAdapter({ setup, setupContract })).toBe(setupContract);
+    expect(resolveChannelSetupExecutionAdapter({})).toBeUndefined();
+  });
+
+  it.each(
+    ["channel-owned", "metadata-only"].flatMap((source) =>
+      [undefined, "work-phone"].map((defaultAccount) => ({ source, defaultAccount })),
+    ),
+  )(
+    "keeps ignored aliases ineligible during cold promotion: $source, default=$defaultAccount",
+    ({ source, defaultAccount }) => {
+      const next = withPluginCache(createPluginCache(), () => {
+        const promotion = {
+          accountKeyPolicy: { canonicalAliasesRequireOwnField: "account" },
+          singleAccountKeysToMove: ["account"],
+          namedAccountPromotionKeys: ["account"],
+        };
+        const plugin = {
+          setupContract: defineChannelSetupContract({
+            fields: {},
+            adapter: {
+              ...promotion,
+              applyAccountConfig: ({ cfg }) => cfg,
+            },
+          }),
+        };
+        const cfg: OpenClawConfig = {
+          channels: {
+            demo: {
+              account: "+12025550123",
+              defaultAccount,
+              accounts: {
+                "Work Phone": { dmPolicy: "open", allowFrom: ["*"] },
+              },
+            },
+          },
+        };
+
+        return moveSingleAccountChannelSectionToDefaultAccount({
+          cfg,
+          channelKey: "demo",
+          setupSurface:
+            source === "metadata-only" ? promotion : resolveChannelSetupExecutionAdapter(plugin),
+        });
+      });
+
+      expect(next.channels?.demo).toEqual({
+        defaultAccount,
+        accounts: {
+          "Work Phone": { dmPolicy: "open", allowFrom: ["*"] },
+          default: { account: "+12025550123" },
+        },
+      });
+    },
+  );
+
   it("requires field keys to match camelCased long flag names", () => {
     expect(() =>
       defineChannelSetupContract({
@@ -209,6 +276,12 @@ describe("defineChannelSetupContract", () => {
           choices: ["socket", "http"],
           cli: { flags: "--mode <mode>", description: "Connection mode" },
         },
+        useEnv: {
+          kind: "boolean",
+          cli: { flags: "--use-env", description: "Use environment credentials" },
+          envVars: ["CHAT_TOKEN", "CHAT_TOKEN_FILE"],
+          envVarMode: "any",
+        },
       },
       adapter: {
         applyAccountConfig: ({ cfg }) => cfg,
@@ -228,6 +301,13 @@ describe("defineChannelSetupContract", () => {
           kind: "choice",
           choices: ["socket", "http"],
           cli: { flags: "--mode <mode>", description: "Connection mode" },
+        },
+        {
+          key: "useEnv",
+          kind: "boolean",
+          cli: { flags: "--use-env", description: "Use environment credentials" },
+          envVars: ["CHAT_TOKEN", "CHAT_TOKEN_FILE"],
+          envVarMode: "any",
         },
       ],
     });

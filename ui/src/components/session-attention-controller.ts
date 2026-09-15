@@ -1,5 +1,5 @@
 import type { ReactiveController, ReactiveControllerHost } from "lit";
-import type { SessionAgentStatus } from "../../../packages/gateway-protocol/src/session-icon.js";
+import type { SessionAgentStatus } from "../../../packages/gateway-protocol/src/session-agent-status.js";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
 import type { GatewaySessionRow } from "../api/types.ts";
 import type { RouteId } from "../app-route-paths.ts";
@@ -13,6 +13,7 @@ import {
   setQuestionPromptClient,
 } from "../app/question-prompt.ts";
 import { t } from "../i18n/index.ts";
+import { formatUiExternalText } from "../lib/format-error.ts";
 import { isGatewayMethodAdvertised } from "../lib/gateway-methods.ts";
 import { areUiSessionKeysEquivalent } from "../lib/sessions/session-key.ts";
 import { SubscriptionsController } from "../lit/subscriptions-controller.ts";
@@ -123,7 +124,7 @@ export class SessionAttentionController implements ReactiveController {
       return SIDEBAR_SESSION_NO_ATTENTION;
     }
     const reason =
-      row.lastRunError?.trim() ||
+      formatUiExternalText(row.lastRunError) ||
       t(
         row.status === "timeout" ? "sessionsView.runErrorTimedOut" : "sessionsView.runErrorUnknown",
       );

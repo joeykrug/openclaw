@@ -7,6 +7,18 @@ import { resolveEnvApiKey } from "openclaw/plugin-sdk/provider-auth";
 
 const QA_CODEX_OAUTH_LIVE_MODEL = "openai/gpt-5.6-luna";
 
+export function resolveQaLiveFrontierAlternateModel(primaryModel: string) {
+  const normalized = primaryModel.toLowerCase();
+  if (normalized === QA_CODEX_OAUTH_LIVE_MODEL) {
+    return "openai/gpt-5.6-terra";
+  }
+  return normalized === "openai/gpt-5.6" ||
+    normalized === "openai/gpt-5.6-sol" ||
+    normalized === "openai/gpt-5.6-terra"
+    ? QA_CODEX_OAUTH_LIVE_MODEL
+    : undefined;
+}
+
 export function resolveQaLiveFrontierPreferredModel() {
   if (resolveEnvApiKey("openai")?.apiKey) {
     return undefined;

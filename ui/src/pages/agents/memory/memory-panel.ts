@@ -7,14 +7,22 @@ import {
   type ApplicationGateway,
   type ApplicationGatewaySnapshot,
 } from "../../../app/context.ts";
+import {
+  showConfirmDialog,
+  type ConfirmDialogOptions,
+} from "../../../components/confirm-dialog.ts";
+import { renderSettingsDefaultDescription } from "../../../components/settings-ui.ts";
 import { t } from "../../../i18n/index.ts";
-import { currentConfigObject } from "../../../lib/config/index.ts";
+import { registerDreamingEnglish } from "../../../i18n/locales/en-dreaming.ts";
+import { currentConfigObject } from "../../../lib/config/config-state-model.ts";
 import { formatTimeMs } from "../../../lib/format.ts";
 import { isPluginEnabledInConfigSnapshot } from "../../../lib/plugin-activation.ts";
+import { GatewayPageController } from "../../../lit/gateway-page-controller.ts";
 import { OpenClawLightDomElement } from "../../../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../../../lit/subscriptions-controller.ts";
 import {
   backfillDreamDiary,
+  canCallDreamingMethod,
   copyDreamingArchivePath,
   createDreamingState,
   dedupeDreamDiary,
@@ -30,7 +38,14 @@ import {
   type DreamingState,
 } from "./dreaming.ts";
 import { renderDreamingToggleConfirmation } from "./toggle-confirmation.ts";
-import { createDreamingViewState, renderDreaming, type DreamingViewState } from "./view.ts";
+import {
+  createDreamingViewState,
+  renderDreaming,
+  resetWikiPreview,
+  type DreamingViewState,
+} from "./view.ts";
+
+registerDreamingEnglish();
 
 type WikiPagePreview = {
   title: string;
@@ -109,40 +124,27 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
   @state() private pendingEnabled: boolean | null = null;
 
   private readonly viewState: DreamingViewState = createDreamingViewState();
-  private gatewaySource: ApplicationGateway | null = null;
-  private gatewayBindingEpoch = 0;
-  private gatewayEpoch = 0;
-  private hasBoundGatewaySource = false;
-  private readonly subscriptions = new SubscriptionsController(this)
-    .effect(
-      () => this.context?.gateway,
-      (gateway) => {
-        const sourceReplaced = this.hasBoundGatewaySource;
-        this.hasBoundGatewaySource = true;
-        this.gatewaySource = gateway;
-        const bindingEpoch = ++this.gatewayBindingEpoch;
-        this.gatewayEpoch += 1;
-        const cleanup = gateway.subscribe((snapshot) => {
-          if (this.isGatewayBindingCurrent(gateway, bindingEpoch)) {
-            this.applyGatewaySnapshot(snapshot);
-          }
-        });
-        this.applyGatewaySnapshot(gateway.snapshot, sourceReplaced ? "replacement" : "initial");
-        return cleanup;
-      },
-    )
-    .effect(
-      () => this.context?.runtimeConfig,
-      (runtimeConfig) => {
+  private readonly gateway = new GatewayPageController(this, {
+    getGateway: () => this.context?.gateway,
+    onSnapshot: ({ snapshot, initial, sourceChanged }) =>
+      this.applyGatewaySnapshot(
+        snapshot,
+        initial ? "initial" : sourceChanged ? "replacement" : undefined,
+      ),
+  });
+  private selectedAgentId: string | null = null;
+  private readonly subscriptions = new SubscriptionsController(this).effect(
+    () => this.context?.runtimeConfig,
+    (runtimeConfig) => {
+      this.syncConfigSnapshot();
+      return runtimeConfig.subscribe(() => {
         this.syncConfigSnapshot();
-        return runtimeConfig.subscribe(() => {
-          this.syncConfigSnapshot();
-          this.requestUpdate();
-        });
-      },
-    );
+        this.requestUpdate();
+      });
+    },
+  );
 
-  override willUpdate(changed: PropertyValues<this>) {
+  override updated(changed: PropertyValues<this>) {
     if (changed.has("agentId")) {
       this.applyAgentId();
     }
@@ -150,59 +152,34 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
 
   override disconnectedCallback() {
     this.subscriptions.clear();
-    this.gatewayBindingEpoch += 1;
-    this.gatewayEpoch += 1;
-    this.gatewaySource = null;
     this.resetTransientState();
     this.dreaming = createDreamingState();
     super.disconnectedCallback();
   }
 
-  private isGatewayBindingCurrent(gateway: ApplicationGateway, bindingEpoch: number): boolean {
-    return (
-      this.isConnected &&
-      this.gatewaySource === gateway &&
-      this.gatewayBindingEpoch === bindingEpoch &&
-      this.context.gateway === gateway
-    );
-  }
-
   private captureTaskScope(): DreamingTaskScope | null {
-    const gateway = this.gatewaySource;
+    const gateway = this.gateway.gateway;
     if (!gateway) {
       return null;
     }
-    return { gateway, epoch: this.gatewayEpoch, state: this.dreaming };
+    return { gateway, epoch: this.gateway.epoch, state: this.dreaming };
   }
 
   private isTaskScopeCurrent(scope: DreamingTaskScope): boolean {
     return (
       this.isConnected &&
-      this.gatewaySource === scope.gateway &&
-      this.gatewayEpoch === scope.epoch &&
+      this.gateway.gateway === scope.gateway &&
+      this.gateway.epoch === scope.epoch &&
       this.context.gateway === scope.gateway &&
       this.dreaming === scope.state
     );
   }
 
   private resetTransientState() {
-    this.resetWikiPreview();
+    resetWikiPreview(this.viewState);
     this.toggleConfirmOpen = false;
     this.toggleConfirmLoading = false;
     this.pendingEnabled = null;
-  }
-
-  private resetWikiPreview() {
-    this.viewState.wikiPreviewRequestId += 1;
-    this.viewState.wikiPreviewOpen = false;
-    this.viewState.wikiPreviewLoading = false;
-    this.viewState.wikiPreviewTitle = "";
-    this.viewState.wikiPreviewPath = "";
-    this.viewState.wikiPreviewUpdatedAt = null;
-    this.viewState.wikiPreviewContent = "";
-    this.viewState.wikiPreviewTotalLines = null;
-    this.viewState.wikiPreviewTruncated = false;
-    this.viewState.wikiPreviewError = null;
   }
 
   private createGatewayState(snapshot = this.context.gateway.snapshot): DreamingState {
@@ -212,7 +189,7 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
       hello: snapshot.hello,
       configSnapshot: this.context.runtimeConfig.state.configSnapshot,
       applySessionKey: snapshot.sessionKey,
-      selectedAgentId: this.agentId.trim() || null,
+      selectedAgentId: this.selectedAgentId,
     });
   }
 
@@ -224,9 +201,6 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
     const connectionChanged = this.dreaming.connected !== (snapshot.phase === "connected");
     const becameConnected = snapshot.phase === "connected" && !this.dreaming.connected;
     const replaceState = sourceBind === "replacement" || clientChanged || connectionChanged;
-    if (connectionChanged) {
-      this.gatewayEpoch += 1;
-    }
     if (replaceState) {
       this.dreaming = this.createGatewayState(snapshot);
       if (sourceBind !== "initial") {
@@ -237,21 +211,26 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
       this.dreaming.hello = snapshot.hello;
       this.dreaming.applySessionKey = snapshot.sessionKey;
     }
-    if (snapshot.phase === "connected" && (replaceState || becameConnected)) {
+    if (
+      snapshot.phase === "connected" &&
+      this.selectedAgentId &&
+      (replaceState || becameConnected)
+    ) {
       void this.loadAll();
     }
     this.requestUpdate();
   }
 
   private applyAgentId() {
-    const agentId = this.agentId.trim();
-    if (!agentId || this.dreaming.selectedAgentId === agentId) {
+    const agentId = this.agentId.trim() || null;
+    if (this.selectedAgentId === agentId) {
       return;
     }
-    this.gatewayEpoch += 1;
+    this.selectedAgentId = agentId;
+    this.gateway.invalidate();
     this.resetTransientState();
     this.dreaming = this.createGatewayState();
-    if (this.dreaming.connected) {
+    if (agentId && this.dreaming.connected) {
       void this.loadAll();
     }
   }
@@ -279,9 +258,20 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
     }
   }
 
+  private async confirmDreamingTask(
+    task: (state: DreamingState) => Promise<boolean>,
+    confirmation: ConfirmDialogOptions,
+  ) {
+    const scope = this.captureTaskScope();
+    if (!scope || !(await showConfirmDialog(confirmation)) || !this.isTaskScopeCurrent(scope)) {
+      return;
+    }
+    await this.runDreamingTask(task, scope);
+  }
+
   private async loadAll(refreshConfig = false) {
     const scope = this.captureTaskScope();
-    if (!scope || !scope.state.client || !scope.state.connected) {
+    if (!scope || !scope.state.client || !scope.state.connected || !scope.state.selectedAgentId) {
       return;
     }
     const runtimeConfig = this.context.runtimeConfig;
@@ -304,6 +294,7 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
 
   private setEnabled(enabled: boolean, dreamingOn: boolean) {
     if (
+      !canCallDreamingMethod(this.dreaming, "config.patch", "operator.admin") ||
       this.dreaming.dreamingModeSaving ||
       this.toggleConfirmLoading ||
       this.toggleConfirmOpen ||
@@ -327,7 +318,11 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
 
   private async confirmToggle() {
     const enabled = this.pendingEnabled;
-    if (enabled == null || this.toggleConfirmLoading) {
+    if (
+      enabled == null ||
+      this.toggleConfirmLoading ||
+      !canCallDreamingMethod(this.dreaming, "config.patch", "operator.admin")
+    ) {
       return;
     }
     this.toggleConfirmLoading = true;
@@ -339,8 +334,13 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
       return;
     }
     try {
+      const canDispatch = () =>
+        this.isTaskScopeCurrent(scope) &&
+        this.context.runtimeConfig === runtimeConfig &&
+        canCallDreamingMethod(scope.state, "config.patch", "operator.admin");
       const updated = await this.runDreamingTask(
-        (dreamingState) => updateDreamingEnabled(dreamingState, runtimeConfig, enabled),
+        (dreamingState) =>
+          updateDreamingEnabled(dreamingState, runtimeConfig, enabled, canDispatch),
         scope,
       );
       if (!this.isTaskScopeCurrent(scope) || this.context.runtimeConfig !== runtimeConfig) {
@@ -371,20 +371,17 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
   private async openWikiPage(lookup: string): Promise<WikiPagePreview | null> {
     const scope = this.captureTaskScope();
     const client = scope?.state.client;
-    if (!scope || !client || !scope.state.connected) {
+    const agentId = scope?.state.selectedAgentId;
+    if (!scope || !client || !scope.state.connected || !agentId) {
       return null;
     }
-    const agentId = scope.state.selectedAgentId?.trim() || null;
     const payload = await client.request("wiki.get", {
       lookup,
       fromLine: 1,
       lineCount: 5000,
-      ...(agentId ? { agentId } : {}),
+      agentId,
     });
-    if (
-      !this.isTaskScopeCurrent(scope) ||
-      (scope.state.selectedAgentId?.trim() || null) !== agentId
-    ) {
+    if (!this.isTaskScopeCurrent(scope) || scope.state.selectedAgentId !== agentId) {
       return null;
     }
     return readWikiPagePreview(payload, lookup);
@@ -392,7 +389,7 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
 
   private async refreshWikiData(task: (state: DreamingState) => Promise<void>) {
     const scope = this.captureTaskScope();
-    if (!scope) {
+    if (!scope?.state.selectedAgentId) {
       return;
     }
     const runtimeConfig = this.context.runtimeConfig;
@@ -407,12 +404,15 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
   override render() {
     const dreaming = this.dreaming;
     const configState = this.context.runtimeConfig.state;
-    const dreamingOn =
-      dreaming.dreamingStatus?.enabled ??
-      resolveConfiguredDreaming(currentConfigObject(configState)).enabled;
+    const configuredDreaming = resolveConfiguredDreaming(currentConfigObject(configState));
+    // The status RPC can complete after config switches the engine Off. Keep the
+    // cached payload for a future refresh, but never present it as current runtime state.
+    const dreamingStatus = configuredDreaming.engineOff ? null : dreaming.dreamingStatus;
+    const dreamingOn = dreamingStatus?.enabled ?? configuredDreaming.enabled;
     const loading = dreaming.dreamingStatusLoading || dreaming.dreamingModeSaving;
+    const canUpdateConfig = canCallDreamingMethod(dreaming, "config.patch", "operator.admin");
     const refreshLoading = dreaming.dreamingStatusLoading || dreaming.dreamDiaryLoading;
-    const selectedAgentId = dreaming.selectedAgentId ?? this.agentId;
+    const selectedAgentId = dreaming.selectedAgentId ?? "";
 
     return html`
       <section class="content-header content-header--page agent-memory-panel__header">
@@ -425,9 +425,19 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
             >
               ${refreshLoading ? t("dreaming.header.refreshing") : t("dreaming.header.refresh")}
             </button>
+            <span class="muted">
+              ${
+                configuredDreaming.engineOff
+                  ? t("dreaming.header.engineOff")
+                  : renderSettingsDefaultDescription(
+                      t("common.enabled"),
+                      configuredDreaming.overridden,
+                    )
+              }
+            </span>
             <button
               class="dreams__phase-toggle ${dreamingOn ? "dreams__phase-toggle--on" : ""}"
-              ?disabled=${loading}
+              ?disabled=${!canUpdateConfig || loading || configuredDreaming.engineOff}
               @click=${() => this.setEnabled(!dreamingOn, dreamingOn)}
             >
               <span class="dreams__phase-toggle-dot"></span>
@@ -439,20 +449,47 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
         </div>
       </section>
       ${renderDreaming({
+        access: {
+          canOpenConfig: canCallDreamingMethod(dreaming, "config.openFile", "operator.admin", {
+            requireAdvertisement: false,
+          }),
+          canBackfillDiary: canCallDreamingMethod(
+            dreaming,
+            "doctor.memory.backfillDreamDiary",
+            "operator.write",
+          ),
+          canDedupeDreamDiary: canCallDreamingMethod(
+            dreaming,
+            "doctor.memory.dedupeDreamDiary",
+            "operator.write",
+          ),
+          canResetDiary: canCallDreamingMethod(
+            dreaming,
+            "doctor.memory.resetDreamDiary",
+            "operator.write",
+          ),
+          canResetGroundedShortTerm: canCallDreamingMethod(
+            dreaming,
+            "doctor.memory.resetGroundedShortTerm",
+            "operator.write",
+          ),
+          canRepairDreamingArtifacts: canCallDreamingMethod(
+            dreaming,
+            "doctor.memory.repairDreamingArtifacts",
+            "operator.write",
+          ),
+        },
         viewState: this.viewState,
         active: dreamingOn,
         selectedAgentId,
-        shortTermCount: dreaming.dreamingStatus?.shortTermCount ?? 0,
-        groundedSignalCount: dreaming.dreamingStatus?.groundedSignalCount ?? 0,
-        totalSignalCount: dreaming.dreamingStatus?.totalSignalCount ?? 0,
-        promotedCount: dreaming.dreamingStatus?.promotedToday ?? 0,
-        phases: dreaming.dreamingStatus?.phases ?? undefined,
-        shortTermEntries: dreaming.dreamingStatus?.shortTermEntries ?? [],
-        promotedEntries: dreaming.dreamingStatus?.promotedEntries ?? [],
+        shortTermCount: dreamingStatus?.shortTermCount ?? 0,
+        promotedCount: dreamingStatus?.promotedToday ?? 0,
+        phases: dreamingStatus?.phases ?? undefined,
+        shortTermEntries: dreamingStatus?.shortTermEntries ?? [],
+        promotedEntries: dreamingStatus?.promotedEntries ?? [],
         dreamingOf: null,
-        nextCycle: resolveDreamingNextCycle(dreaming.dreamingStatus),
-        timezone: dreaming.dreamingStatus?.timezone ?? null,
-        statusLoading: dreaming.dreamingStatusLoading,
+        nextCycle: resolveDreamingNextCycle(dreamingStatus),
+        timezone: dreamingStatus?.timezone ?? null,
         statusError: dreaming.dreamingStatusError,
         modeSaving: dreaming.dreamingModeSaving,
         dreamDiaryLoading: dreaming.dreamDiaryLoading,
@@ -460,7 +497,6 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
         dreamDiaryActionMessage: dreaming.dreamDiaryActionMessage,
         dreamDiaryActionArchivePath: dreaming.dreamDiaryActionArchivePath,
         dreamDiaryError: dreaming.dreamDiaryError,
-        dreamDiaryPath: dreaming.dreamDiaryPath,
         dreamDiaryContent: dreaming.dreamDiaryContent,
         memoryWikiEnabled: isPluginEnabledInConfigSnapshot(
           configState.configSnapshot,
@@ -473,7 +509,6 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
         wikiOverviewLoading: dreaming.wikiOverviewLoading,
         wikiOverviewError: dreaming.wikiOverviewError,
         wikiOverview: dreaming.wikiOverview,
-        onRefresh: () => void this.loadAll(true),
         onRefreshDiary: () => void this.runDreamingTask(loadDreamDiary),
         onRefreshImports: () => void this.refreshWikiData(loadWikiImportInsights),
         onRefreshWikiOverview: () => void this.refreshWikiData(loadWikiOverview),
@@ -481,10 +516,21 @@ class AgentMemoryPanel extends OpenClawLightDomElement {
         onOpenWikiPage: (lookup) => this.openWikiPage(lookup),
         onBackfillDiary: () => void this.runDreamingTask(backfillDreamDiary),
         onCopyDreamingArchivePath: () => void this.runDreamingTask(copyDreamingArchivePath),
-        onDedupeDreamDiary: () => void this.runDreamingTask(dedupeDreamDiary),
+        onDedupeDreamDiary: () =>
+          void this.confirmDreamingTask(dedupeDreamDiary, {
+            title: t("dreaming.scene.dedupeDiary"),
+            message: t("dreaming.actions.confirmDedupeDescription"),
+            confirmLabel: t("dreaming.scene.dedupeDiary"),
+            danger: true,
+          }),
         onResetDiary: () => void this.runDreamingTask(resetDreamDiary),
         onResetGroundedShortTerm: () => void this.runDreamingTask(resetGroundedShortTerm),
-        onRepairDreamingArtifacts: () => void this.runDreamingTask(repairDreamingArtifacts),
+        onRepairDreamingArtifacts: () =>
+          void this.confirmDreamingTask(repairDreamingArtifacts, {
+            title: t("dreaming.scene.repairCache"),
+            message: t("dreaming.actions.confirmRepairDescription"),
+            confirmLabel: t("dreaming.scene.repairCache"),
+          }),
         onViewStateChange: () => this.requestUpdate(),
       })}
       ${renderDreamingToggleConfirmation({

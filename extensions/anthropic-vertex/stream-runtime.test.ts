@@ -4,7 +4,15 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { createAssistantMessageEventStream, type Model } from "openclaw/plugin-sdk/llm";
+import {
+  createAssistantMessageEventStream,
+  stream as streamModel,
+  type Model,
+} from "openclaw/plugin-sdk/llm";
+import {
+  notifyProviderStreamOpened,
+  withProviderAcceptanceObserver,
+} from "openclaw/plugin-sdk/provider-transport-runtime";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { AnthropicVertexStreamDeps } from "./stream-runtime.js";
 
@@ -360,19 +368,50 @@ describe("createAnthropicVertexStreamFn", () => {
     expect(streamTransportOptions(streamAnthropicMock).temperature).toBe(0.7);
   });
 
-  it("uses Fable 5's always-adaptive Vertex contract", () => {
-    const { deps, streamAnthropicMock } = createStreamDeps();
-    const streamFn = createAnthropicVertexStreamFn("vertex-project", "us-east5", undefined, deps);
-    const model = makeModel({ id: "claude-fable-5", maxTokens: 128000 });
-
-    void streamFn(model, { messages: [] }, { temperature: 0.7 });
-
-    expect(streamTransportOptions(streamAnthropicMock)).toMatchObject({
-      thinkingEnabled: true,
-      effort: "high",
-      maxTokens: 128000,
+  it.each([
+    { id: "claude-fable-5", effort: "medium" },
+    { id: "claude-fable-5-1", effort: "medium" },
+    {
+      id: "production-fable",
+      params: { canonicalModelId: "claude-fable-5-1" },
+      reasoning: false,
+      effort: "medium",
+    },
+    { id: "claude-mythos-5", effort: "high" },
+  ])("sends the shared Vertex default for $id", async ({ effort, ...modelOptions }) => {
+    const { deps } = createStreamDeps();
+    const streamFn = createAnthropicVertexStreamFn(
+      "vertex-project",
+      "us-east5",
+      undefined,
+      { ...deps, streamAnthropic: streamModel },
+      {},
+    );
+    const onPayload = vi.fn((_payload: unknown) => {
+      throw new Error("stop before network");
     });
-    expect(streamTransportOptions(streamAnthropicMock)).not.toHaveProperty("temperature");
+    const model: Model<"anthropic-messages"> = {
+      ...makeModel({ ...modelOptions, maxTokens: 128000 }),
+      name: modelOptions.id,
+      input: ["text"],
+      contextWindow: 1_000_000,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    };
+    const stream = await streamFn(
+      model,
+      { messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+      { temperature: 0.7, onPayload },
+    );
+    const result = await stream.result();
+
+    expect(onPayload, result.errorMessage).toHaveBeenCalledOnce();
+    const payload = onPayload.mock.calls[0]?.[0];
+    expect(payload).toMatchObject({
+      thinking: { type: "adaptive" },
+      output_config: { effort },
+      max_tokens: 128000,
+    });
+    expect(payload).not.toHaveProperty("temperature");
   });
 
   it.each([
@@ -397,21 +436,6 @@ describe("createAnthropicVertexStreamFn", () => {
       }
     },
   );
-
-  it("uses Mythos 5's mandatory adaptive Vertex contract by default", () => {
-    const { deps, streamAnthropicMock } = createStreamDeps();
-    const streamFn = createAnthropicVertexStreamFn("vertex-project", "us-east5", undefined, deps);
-    const model = makeModel({ id: "claude-mythos-5", maxTokens: 128000 });
-
-    void streamFn(model, { messages: [] }, { temperature: 0.7 });
-
-    expect(streamTransportOptions(streamAnthropicMock)).toMatchObject({
-      thinkingEnabled: true,
-      effort: "high",
-      maxTokens: 128000,
-    });
-    expect(streamTransportOptions(streamAnthropicMock)).not.toHaveProperty("temperature");
-  });
 
   it("uses canonical Claude policy for Vertex deployment aliases", () => {
     const { deps, streamAnthropicMock } = createStreamDeps();
@@ -541,6 +565,21 @@ describe("createAnthropicVertexStreamFn", () => {
     expect(transportOptions).not.toHaveProperty("temperature");
   });
 
+  it("forwards the private acceptance observer to the shared Anthropic transport", async () => {
+    const { deps, streamAnthropicMock } = createStreamDeps();
+    const streamFn = createAnthropicVertexStreamFn("vertex-project", "us-east5", undefined, deps);
+    const acceptanceObserver = vi.fn();
+    const onResponse = vi.fn();
+    const options = withProviderAcceptanceObserver({ onResponse }, acceptanceObserver);
+
+    void streamFn(makeModel({ id: "claude-sonnet-4-6" }), { messages: [] }, options);
+
+    const transportOptions = streamTransportOptions(streamAnthropicMock);
+    expect(transportOptions.onResponse).toBe(onResponse);
+    await notifyProviderStreamOpened({ options: transportOptions, cancelStream: vi.fn() });
+    expect(acceptanceObserver).toHaveBeenCalledWith({ kind: "provider_stream_opened" });
+  });
+
   it("keeps already-budgeted cache_control markers intact when forwarding payload hooks", async () => {
     const { deps, streamAnthropicMock } = createStreamDeps();
     const onPayload = vi.fn(async (payload: unknown) => payload);
@@ -589,6 +628,24 @@ describe("createAnthropicVertexStreamFn", () => {
 });
 
 describe("createAnthropicVertexStreamFnForModel", () => {
+  it.each(["us", "eu"])("preserves the %s multi-region SDK endpoint", (region) => {
+    const { deps, anthropicVertexCtorMock, googleAuthClient } = createStreamDeps();
+    const streamFn = createAnthropicVertexStreamFnForModel(
+      { baseUrl: `https://aiplatform.${region}.rep.googleapis.com` },
+      { GOOGLE_CLOUD_PROJECT_ID: "vertex-project" } as NodeJS.ProcessEnv,
+      deps,
+    );
+
+    void streamFn(makeModel({ id: "claude-sonnet-5", maxTokens: 128_000 }), { messages: [] }, {});
+
+    expect(anthropicVertexCtorMock).toHaveBeenCalledWith({
+      googleAuth: googleAuthClient,
+      projectId: "vertex-project",
+      region,
+      baseURL: `https://aiplatform.${region}.rep.googleapis.com/v1`,
+    });
+  });
+
   it("derives project and region from the model and env", () => {
     const { deps, anthropicVertexCtorMock, googleAuthClient } = createStreamDeps();
     const streamFn = createAnthropicVertexStreamFnForModel(

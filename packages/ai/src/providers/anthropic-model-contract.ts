@@ -1,15 +1,28 @@
 // Model-bound thinking cannot be exposed or replayed after a model switch.
 import {
+  CLAUDE_FABLE_5_THINKING_PROFILE,
   requiresClaudeDefaultSampling,
   requiresClaudeMandatoryAdaptiveThinking,
   resolveClaudeFable5ModelIdentity,
   resolveClaudeMythos5ModelIdentity,
+  resolveClaudeNativeThinkingLevelMap,
   resolveClaudeOpus5ModelIdentity,
   resolveClaudeSonnet5ModelIdentity,
+  supportsClaudeNativeMaxEffort,
+  supportsClaudeNativeXhighEffort,
 } from "@openclaw/llm-core";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import type { Context, Model } from "../types.js";
+import { clampThinkingLevel } from "../model-utils.js";
+import type { AnthropicEffort } from "../provider-options.js";
+import type {
+  Context,
+  Model,
+  ModelThinkingLevel,
+  SimpleStreamOptions,
+  StopReason,
+} from "../types.js";
 export {
+  bindsClaudeThinkingPrefix,
   requiresClaudeDefaultSampling,
   requiresClaudeMandatoryAdaptiveThinking,
   resolveClaudeFable5ModelIdentity,
@@ -22,6 +35,9 @@ export {
   supportsClaudeNativeMaxEffort,
   supportsClaudeNativeXhighEffort,
 } from "@openclaw/llm-core";
+
+export const ANTHROPIC_CLAUDE_CODE_VERSION = "2.1.75";
+export const ANTHROPIC_CLAUDE_CODE_BILLING_SYSTEM_BLOCK = `x-anthropic-billing-header: cc_version=${ANTHROPIC_CLAUDE_CODE_VERSION}; cc_entrypoint=sdk-cli;`;
 
 type ReplayModelRef = {
   provider?: string;
@@ -90,7 +106,7 @@ export function requiresClaudeAdaptiveThinking(model: {
   return requiresClaudeMandatoryAdaptiveThinking(model);
 }
 
-/** Return whether omitted thinking should default to adaptive/high. */
+/** Return whether omitted thinking should default to adaptive mode. */
 export function defaultsClaudeAdaptiveThinking(model: {
   id?: string;
   params?: Record<string, unknown>;
@@ -102,6 +118,63 @@ export function defaultsClaudeAdaptiveThinking(model: {
       (resolveClaudeOpus5ModelIdentity(model) !== undefined ||
         resolveClaudeSonnet5ModelIdentity(model) !== undefined))
   );
+}
+
+/** Resolve provider-native effort once for direct and managed Claude requests. */
+export function resolveAnthropicThinkingEffort(
+  model: Model<"anthropic-messages">,
+  level: SimpleStreamOptions["reasoning"],
+): AnthropicEffort {
+  const requestedLevel: ModelThinkingLevel | undefined =
+    level ??
+    (resolveClaudeFable5ModelIdentity(model)
+      ? CLAUDE_FABLE_5_THINKING_PROFILE.defaultLevel
+      : undefined);
+  const thinkingLevelMap = resolveClaudeNativeThinkingLevelMap(model);
+  const clampModel = {
+    ...model,
+    ...(typeof model.params?.canonicalModelId === "string" ? { reasoning: true } : {}),
+    ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+  };
+  const resolvedLevel = requestedLevel ? clampThinkingLevel(clampModel, requestedLevel) : undefined;
+  const mapped = resolvedLevel ? thinkingLevelMap?.[resolvedLevel] : undefined;
+  if (typeof mapped === "string") {
+    return mapped as AnthropicEffort;
+  }
+  switch (resolvedLevel) {
+    case "off":
+    case "minimal":
+    case "low":
+      return "low";
+    case "medium":
+      return "medium";
+    case "xhigh":
+      return supportsClaudeNativeXhighEffort(model) ? "xhigh" : "high";
+    case "max":
+      return supportsClaudeNativeMaxEffort(model) ? "max" : "high";
+    default:
+      return "high";
+  }
+}
+
+/** Normalize Anthropic and Anthropic-compatible terminal reasons identically. */
+export function mapAnthropicStopReason(reason: string | undefined): StopReason {
+  switch (reason) {
+    case "end_turn":
+    case "pause_turn":
+    case "compaction":
+    case "stop_sequence":
+      return "stop";
+    case "max_tokens":
+      return "length";
+    case "tool_use":
+      return "toolUse";
+    case "refusal":
+    case "sensitive":
+      return "error";
+    default:
+      throw new Error(`Unhandled stop reason: ${String(reason)}`);
+  }
 }
 
 /** Remove unsupported assistant prefills while preserving completed tool-use turns. */
@@ -126,8 +199,15 @@ export function prepareClaudeNoPrefillRequestContext(model: Model, context: Cont
     : { ...context, messages: context.messages.slice(0, end) };
 }
 
+type ClaudeSamplingRequestParams = {
+  temperature?: unknown;
+  top_p?: unknown;
+  top_k?: unknown;
+  service_tier?: unknown;
+};
+
 export function applyClaudeRequestContract(
-  params: Record<string, unknown>,
+  params: ClaudeSamplingRequestParams,
   model: {
     id?: string;
     params?: Record<string, unknown>;
@@ -173,6 +253,24 @@ function resolveReplayModelBoundIdentity(ref: ReplayModelRef): string | undefine
   return sonnetIdentity ? `sonnet:${sonnetIdentity}` : undefined;
 }
 
+/**
+ * Fable 5.1 reads thinking from every earlier Claude generation (verified live:
+ * Opus 5, Sonnet 5, Opus 4.8 replay with no drops), while the API silently
+ * drops anything it cannot read. Moving onto it therefore keeps prior reasoning;
+ * every other cross-identity move, including unregistered Mythos targets, is
+ * still dropped here until its replay contract is proven separately.
+ */
+function readsPriorClaudeThinking(targetIdentity: string | undefined): boolean {
+  return (
+    targetIdentity !== undefined && /^fable:claude-fable-5-1(?=$|[^a-z0-9])/.test(targetIdentity)
+  );
+}
+
+function isClaudeReplaySource(ref: ReplayModelRef): boolean {
+  const modelId = hasConcreteResponseModel(ref) ? ref.responseModelId : ref.modelId;
+  return /(?:^|[-/])claude-/.test(normalizeModelId(modelId));
+}
+
 export function resolveModelBoundThinkingReplayMode(params: {
   source: ReplayModelRef;
   target: ReplayModelRef;
@@ -188,6 +286,13 @@ export function resolveModelBoundThinkingReplayMode(params: {
     normalizeModelId(params.source.modelId) === normalizeModelId(params.target.modelId);
   if (!sourceIdentity && !targetIdentity) {
     return "default";
+  }
+  if (
+    sourceApi === targetApi &&
+    readsPriorClaudeThinking(targetIdentity) &&
+    isClaudeReplaySource(params.source)
+  ) {
+    return "preserve";
   }
   if (!sourceIdentity && !hasConcreteResponseModel(params.source) && targetIdentity && sameRoute) {
     return "preserve";

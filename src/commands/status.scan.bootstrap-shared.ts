@@ -1,6 +1,7 @@
 // Shared bootstrap for status scans.
 // Starts update, Tailscale, agent, and gateway probes with cold-start shortcuts for first-run users.
 
+import { measureCliCommandStartup } from "../cli/command-startup-timing.js";
 import type { OpenClawConfig } from "../config/types.js";
 import type { UpdateCheckResult } from "../infra/update-check.js";
 import { runExec } from "../process/exec.js";
@@ -66,6 +67,8 @@ type StatusScanExecRunner = (
 type StatusScanCoreBootstrapParams<TAgentStatus> = {
   coldStart: boolean;
   cfg: OpenClawConfig;
+  configPath: string;
+  env: NodeJS.ProcessEnv;
   hasConfiguredChannels: boolean;
   opts: { timeoutMs?: number; all?: boolean };
   skipUpdateCheck?: boolean;
@@ -117,17 +120,24 @@ export async function createStatusScanCoreBootstrap<TAgentStatus>(
   const agentStatusPromise = skipColdStartNetworkChecks
     ? Promise.resolve(buildColdStartAgentLocalStatuses() as TAgentStatus)
     : params.getAgentLocalStatuses(params.cfg);
-  const gatewayProbePromise = resolveGatewayProbeSnapshot({
-    cfg: params.cfg,
-    opts: {
-      ...params.opts,
-      ...(params.gatewayProbeTimeoutMs !== undefined
-        ? { timeoutMs: params.gatewayProbeTimeoutMs }
-        : {}),
-      ...(skipColdStartNetworkChecks ? { skipProbe: true } : {}),
-      localStatusRpcFallback: params.includeLocalStatusRpcFallback !== false,
-    },
-  });
+  const gatewayProbePromise = measureCliCommandStartup(
+    "status.gateway-probe",
+    () =>
+      resolveGatewayProbeSnapshot({
+        cfg: params.cfg,
+        configPath: params.configPath,
+        env: params.env,
+        opts: {
+          ...params.opts,
+          ...(params.gatewayProbeTimeoutMs !== undefined
+            ? { timeoutMs: params.gatewayProbeTimeoutMs }
+            : {}),
+          ...(skipColdStartNetworkChecks ? { skipProbe: true } : {}),
+          localStatusRpcFallback: params.includeLocalStatusRpcFallback !== false,
+        },
+      }),
+    { config: params.cfg, env: params.env },
+  );
 
   return {
     tailscaleMode,
@@ -140,7 +150,6 @@ export async function createStatusScanCoreBootstrap<TAgentStatus>(
       buildTailscaleHttpsUrl({
         tailscaleMode,
         tailscaleDns: await tailscaleDnsPromise,
-        serviceName: params.cfg.gateway?.tailscale?.serviceName,
         controlUiBasePath: params.cfg.gateway?.controlUi?.basePath,
       }),
   };

@@ -1,5 +1,6 @@
 // Msteams tests cover reply stream controller plugin behavior.
 import { describe, expect, it, vi } from "vitest";
+import { teamsQuotedTableReply } from "./format.test-fixtures.js";
 import { createTeamsReplyStreamController } from "./reply-stream-controller.js";
 
 type StreamCloseResult = { id: string } | undefined;
@@ -121,7 +122,7 @@ describe("createTeamsReplyStreamController", () => {
     expect(stream.emit).toHaveBeenNthCalledWith(2, "Next");
   });
 
-  it("falls back and closes the stream for non-whitespace rewrites", async () => {
+  it("replaces non-whitespace rewrites through the native stream", async () => {
     const stream = makeStream();
     const ctrl = makeController({ stream });
 
@@ -130,10 +131,217 @@ describe("createTeamsReplyStreamController", () => {
 
     expect(stream.emit).toHaveBeenCalledTimes(1);
     expect(stream.emit).toHaveBeenCalledWith("abcde");
-    expect(ctrl.preparePayload({ text: "abXYZ" })).toEqual({ text: "abXYZ" });
-    await ctrl.finalize();
+    expect(ctrl.preparePayload({ text: "abXYZ" })).toBeUndefined();
+    expect(stream.emit).toHaveBeenCalledTimes(2);
+    expect(stream.emit).toHaveBeenLastCalledWith(
+      expect.objectContaining({ type: "message", text: "abXYZ" }),
+    );
+    await expect(ctrl.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      messageId: "stream-final",
+      content: "abXYZ",
+      logicalContent: "abXYZ",
+    });
     expect(stream.clearText).toHaveBeenCalledTimes(1);
     expect(stream.close).toHaveBeenCalled();
+  });
+
+  it("retains an acknowledged replacement when stream close produces no activity", async () => {
+    const stream = makeAcknowledgedStream();
+    const ctrl = makeController({ stream });
+
+    ctrl.onPartialReply({ text: "abcde" });
+    stream.acknowledge("abcde");
+    ctrl.onPartialReply({ text: "provider replacement" });
+    expect(
+      ctrl.preparePayload({
+        text: "provider replacement",
+        mediaUrl: "https://example.test/replacement.png",
+      }),
+    ).toBeUndefined();
+    stream.acknowledge("provider replacement");
+    stream.close.mockResolvedValueOnce(undefined);
+
+    await expect(ctrl.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      messageId: "stream-acknowledged",
+      content: "provider replacement",
+      logicalContent: "provider replacement",
+      postNativePayloads: [
+        {
+          text: undefined,
+          mediaUrl: "https://example.test/replacement.png",
+        },
+      ],
+    });
+  });
+
+  it("falls back to the full replacement when close fails before acknowledgement", async () => {
+    const stream = makeAcknowledgedStream();
+    const ctrl = makeController({ stream });
+
+    ctrl.onPartialReply({ text: "abcde" });
+    stream.acknowledge("abcde");
+    ctrl.onPartialReply({ text: "provider replacement" });
+    expect(ctrl.preparePayload({ mediaUrl: "https://example.test/before.png" })).toBeUndefined();
+    expect(
+      ctrl.preparePayload({
+        text: "provider replacement",
+        mediaUrl: "https://example.test/replacement.png",
+      }),
+    ).toBeUndefined();
+    stream.close.mockRejectedValueOnce(new Error("close failed"));
+
+    await expect(ctrl.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      messageId: "stream-acknowledged",
+      content: "abcde",
+      logicalContent: "provider replacement",
+      postNativePayloads: [
+        { mediaUrl: "https://example.test/before.png" },
+        {
+          text: "provider replacement",
+          mediaUrl: "https://example.test/replacement.png",
+        },
+      ],
+    });
+  });
+
+  it("ignores a delayed old chunk that is only a prefix of the replacement", async () => {
+    const stream = makeAcknowledgedStream();
+    const ctrl = makeController({ stream });
+
+    ctrl.onPartialReply({ text: "abcde" });
+    stream.acknowledge("abcde");
+    ctrl.onPartialReply({ text: "ab replacement" });
+    expect(ctrl.preparePayload({ text: "ab replacement" })).toBeUndefined();
+    stream.acknowledge("ab");
+    stream.close.mockRejectedValueOnce(new Error("close failed"));
+
+    await expect(ctrl.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      messageId: "stream-acknowledged",
+      content: "abcde",
+      logicalContent: "ab replacement",
+      postNativePayloads: [{ text: "ab replacement" }],
+    });
+  });
+
+  it("rejects a delayed common-prefix chunk while awaiting replacement acknowledgement", async () => {
+    const stream = makeAcknowledgedStream();
+    const ctrl = makeController({ stream });
+
+    ctrl.onPartialReply({ text: "abcdef" });
+    ctrl.onPartialReply({ text: "abcXYZ" });
+    expect(ctrl.preparePayload({ text: "abcXYZ" })).toBeUndefined();
+    stream.acknowledge("abc");
+    stream.close.mockRejectedValueOnce(new Error("close failed"));
+
+    await expect(ctrl.finalize()).resolves.toEqual({
+      visibleReplySent: false,
+      logicalContent: "abcXYZ",
+      postNativePayloads: [{ text: "abcXYZ" }],
+    });
+  });
+
+  it("uses the latest partial when no final text payload follows a rewrite", async () => {
+    const stream = makeAcknowledgedStream();
+    const ctrl = makeController({ stream });
+
+    ctrl.onPartialReply({ text: "abcde" });
+    stream.acknowledge("abcde");
+    ctrl.onPartialReply({ text: "abXYZ" });
+    ctrl.onPartialReply({ text: "abcdef" });
+    expect(ctrl.preparePayload({ mediaUrl: "https://example.test/final.png" })).toBeUndefined();
+
+    await expect(ctrl.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      messageId: "stream-final",
+      content: "abcdef",
+      logicalContent: "abcdef",
+      postNativePayloads: [{ mediaUrl: "https://example.test/final.png" }],
+    });
+    expect(stream.emit).toHaveBeenLastCalledWith(
+      expect.objectContaining({ type: "message", text: "abcdef" }),
+    );
+  });
+
+  it("suppresses a replacement when emit synchronously discovers Stop", async () => {
+    const stream = makeAcknowledgedStream();
+    const ctrl = makeController({ stream });
+
+    ctrl.onPartialReply({ text: "abcde" });
+    stream.acknowledge("abcde");
+    ctrl.onPartialReply({ text: "provider replacement" });
+    stream.emit.mockImplementation(() => {
+      const error = new Error("stream canceled");
+      error.name = "StreamCancelledError";
+      throw error;
+    });
+
+    expect(ctrl.preparePayload({ text: "provider replacement" })).toBeUndefined();
+    await expect(ctrl.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      messageId: "stream-acknowledged",
+      content: "abcde",
+    });
+    expect(stream.close).not.toHaveBeenCalled();
+  });
+
+  it("holds payloads around replacement text until native settlement", async () => {
+    const stream = makeAcknowledgedStream();
+    const ctrl = makeController({ stream });
+
+    ctrl.onPartialReply({ text: "abcde" });
+    stream.acknowledge("abcde");
+    ctrl.onPartialReply({ text: "provider replacement" });
+
+    expect(ctrl.preparePayload({ mediaUrl: "https://example.test/before.png" })).toBeUndefined();
+    expect(ctrl.preparePayload({ text: "provider replacement" })).toBeUndefined();
+    expect(
+      ctrl.preparePayload({
+        text: "second payload",
+        mediaUrl: "https://example.test/after.png",
+      }),
+    ).toBeUndefined();
+
+    await expect(ctrl.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      messageId: "stream-final",
+      content: "provider replacement",
+      logicalContent: "provider replacement\nsecond payload",
+      postNativePayloads: [
+        { mediaUrl: "https://example.test/before.png" },
+        { text: "second payload", mediaUrl: "https://example.test/after.png" },
+      ],
+    });
+  });
+
+  it("preserves held payload order after replacement emit fails", async () => {
+    const stream = makeAcknowledgedStream();
+    const ctrl = makeController({ stream });
+
+    ctrl.onPartialReply({ text: "abcde" });
+    stream.acknowledge("abcde");
+    ctrl.onPartialReply({ text: "provider replacement" });
+    expect(ctrl.preparePayload({ mediaUrl: "https://example.test/before.png" })).toBeUndefined();
+    stream.emit.mockImplementationOnce(() => {
+      throw new Error("network failure");
+    });
+    expect(ctrl.preparePayload({ text: "provider replacement" })).toBeUndefined();
+    expect(ctrl.preparePayload({ text: "later payload" })).toBeUndefined();
+
+    await expect(ctrl.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      messageId: "stream-final",
+      content: "abcde",
+      logicalContent: "provider replacement\nlater payload",
+      postNativePayloads: [
+        { mediaUrl: "https://example.test/before.png" },
+        { text: "provider replacement" },
+        { text: "later payload" },
+      ],
+    });
   });
 
   it("ignores duplicate or out-of-order partial replies that don't extend the text", () => {
@@ -179,13 +387,18 @@ describe("createTeamsReplyStreamController", () => {
     });
   });
 
-  it("allows fallback delivery for second text segment after tool calls", () => {
+  it.each([false, true])("keeps later partial segments whole with settled=%s", async (settled) => {
     const stream = makeStream();
     const ctrl = makeController({ stream });
 
     ctrl.onPartialReply({ text: "First segment" });
     expect(ctrl.preparePayload({ text: "First segment" })).toBeUndefined();
+    expect(ctrl.claimNativeDelivery()).toBe(true);
+    if (settled) {
+      await ctrl.finalize();
+    }
 
+    ctrl.onPartialReply({ text: "Second segment after tools" });
     const result = ctrl.preparePayload({ text: "Second segment after tools" });
     expect(result).toEqual({ text: "Second segment after tools" });
   });
@@ -277,6 +490,32 @@ describe("createTeamsReplyStreamController", () => {
     expect(stream.close).toHaveBeenCalled();
   });
 
+  it("preserves disabled quoted tables when finalizing formatted replies", async () => {
+    const { source: text, expected } = teamsQuotedTableReply;
+    const stream = makeStream();
+    const ctrl = createTeamsReplyStreamController({
+      allowProviderPreview: true,
+      conversationType: "personal",
+      context: makeContext(stream),
+      feedbackLoopEnabled: false,
+      tableMode: "off",
+    });
+
+    ctrl.onPartialReply({ text });
+    expect(ctrl.preparePayload({ text })).toBeUndefined();
+    await expect(ctrl.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      messageId: "stream-final",
+      content: expected,
+      logicalContent: text,
+    });
+    expect(stream.clearText).toHaveBeenCalledTimes(1);
+    expect(stream.emit).toHaveBeenLastCalledWith(
+      expect.objectContaining({ type: "message", text: expected }),
+    );
+    expect(stream.close).toHaveBeenCalledTimes(1);
+  });
+
   it("returns suppressed final payload when stream close produces no final activity", async () => {
     const stream = makeStream();
     stream.close.mockResolvedValueOnce(undefined);
@@ -286,8 +525,7 @@ describe("createTeamsReplyStreamController", () => {
     expect(ctrl.preparePayload({ text: "streamed final" })).toBeUndefined();
 
     await expect(ctrl.finalize()).resolves.toEqual({
-      visibleReplySent: true,
-      content: "streamed final",
+      visibleReplySent: false,
       fallbackPayload: { text: "streamed final" },
     });
   });
@@ -304,8 +542,7 @@ describe("createTeamsReplyStreamController", () => {
     });
 
     await expect(ctrl.finalize()).resolves.toEqual({
-      visibleReplySent: true,
-      content: "streamed final",
+      visibleReplySent: false,
       fallbackPayload: {
         text: "streamed final",
         mediaUrl: undefined,
@@ -323,8 +560,7 @@ describe("createTeamsReplyStreamController", () => {
     expect(ctrl.preparePayload({ text: "streamed final" })).toBeUndefined();
 
     await expect(ctrl.finalize()).resolves.toEqual({
-      visibleReplySent: true,
-      content: "streamed final",
+      visibleReplySent: false,
       fallbackPayload: { text: "streamed final" },
     });
   });
@@ -350,6 +586,7 @@ describe("createTeamsReplyStreamController", () => {
           streaming: {
             mode: "progress",
             progress: {
+              toolProgress: true,
               label: "Working",
               maxLines: 3,
             },
@@ -377,7 +614,7 @@ describe("createTeamsReplyStreamController", () => {
       context: makeContext(stream),
       feedbackLoopEnabled: false,
       msteamsConfig: {
-        streaming: { mode: "progress", progress: { label: false } },
+        streaming: { mode: "progress", progress: { toolProgress: true, label: false } },
       } as never,
     });
 
@@ -406,7 +643,7 @@ describe("createTeamsReplyStreamController", () => {
         feedbackLoopEnabled: false,
         log: { debug: vi.fn() } as never,
         msteamsConfig: {
-          streaming: { mode: "progress", progress: { label: "Working" } },
+          streaming: { mode: "progress", progress: { toolProgress: true, label: "Working" } },
         } as never,
       });
 
@@ -432,25 +669,36 @@ describe("createTeamsReplyStreamController", () => {
       conversationType: "personal",
       context: makeContext(stream),
       feedbackLoopEnabled: false,
-      msteamsConfig: { streaming: { mode: "progress" } } as never,
+      msteamsConfig: { streaming: { mode: "progress", progress: { toolProgress: true } } } as never,
     });
 
     expect(ctrl.preparePayload({ text: "complete final answer" })).toBeUndefined();
     expect(stream.emit).toHaveBeenCalledWith("complete final answer");
   });
 
-  it("ignores plan updates after final answer streaming starts", async () => {
+  it("ignores progress after final answer streaming starts and settles", async () => {
     const stream = makeStream();
     const ctrl = createTeamsReplyStreamController({
       allowProviderPreview: true,
       conversationType: "personal",
       context: makeContext(stream),
       feedbackLoopEnabled: false,
-      msteamsConfig: { streaming: { mode: "progress" } } as never,
+      msteamsConfig: { streaming: { mode: "progress", progress: { toolProgress: true } } } as never,
     });
 
     expect(ctrl.preparePayload({ text: "complete final answer" })).toBeUndefined();
     await ctrl.pushPlanProgress([{ step: "Late plan", status: "in_progress" }]);
+    const lateFailure = {
+      id: "late-failure",
+      kind: "item" as const,
+      label: "Late failure",
+      text: "Late failure",
+      status: "failed",
+    };
+    await ctrl.pushProgressLine(lateFailure);
+    await ctrl.finalize();
+    await ctrl.pushPlanProgress([{ step: "Late settled plan", status: "in_progress" }]);
+    await ctrl.pushProgressLine(lateFailure);
 
     expect(stream.update).not.toHaveBeenCalled();
   });
@@ -466,7 +714,7 @@ describe("createTeamsReplyStreamController", () => {
       context: makeContext(stream),
       feedbackLoopEnabled: false,
       log: { debug: vi.fn() } as never,
-      msteamsConfig: { streaming: { mode: "progress" } } as never,
+      msteamsConfig: { streaming: { mode: "progress", progress: { toolProgress: true } } } as never,
     });
 
     expect(ctrl.preparePayload({ text: "complete final answer" })).toEqual({
@@ -513,7 +761,9 @@ describe("createTeamsReplyStreamController", () => {
         conversationType: "personal",
         context: makeContext(stream),
         feedbackLoopEnabled: false,
-        msteamsConfig: { streaming: { mode: "progress" } } as never,
+        msteamsConfig: {
+          streaming: { mode: "progress", progress: { toolProgress: true } },
+        } as never,
       });
       await expect(ctrl.noteProgressWork({ toolName: "exec" })).resolves.toBeUndefined();
     });
@@ -522,6 +772,7 @@ describe("createTeamsReplyStreamController", () => {
       const stream = makeStream();
       const ctrl = makeController({ stream });
       ctrl.onPartialReply({ text: "partial" });
+      expect(ctrl.preparePayload({ text: "partial" })).toBeUndefined();
       // Cancel after we've started streaming, then make the final emit throw.
       stream.emit.mockImplementation(() => {
         throw makeCancelError();
@@ -529,8 +780,7 @@ describe("createTeamsReplyStreamController", () => {
       // Must not throw — finalize's pre-check on stream.canceled may miss
       // the cancellation that happens between check and emit.
       await expect(ctrl.finalize()).resolves.toEqual({
-        visibleReplySent: true,
-        content: "partial",
+        visibleReplySent: false,
       });
     });
 
@@ -613,7 +863,7 @@ describe("createTeamsReplyStreamController", () => {
       expect(ctrl.preparePayload({ text: "hello again" })).toEqual({
         text: "hello again",
       });
-      expect(stream.events.off).toHaveBeenCalledOnce();
+      expect(stream.events.off).not.toHaveBeenCalled();
     });
 
     it("ignores unrelated, informative, and out-of-order stream acknowledgements", () => {
@@ -681,10 +931,12 @@ describe("createTeamsReplyStreamController", () => {
 
       await expect(ctrl.finalize()).resolves.toEqual({
         visibleReplySent: true,
-        content: "hello world",
+        content: "hello",
+        messageId: "stream-acknowledged",
         fallbackPayload: { text: " world" },
       });
       expect(stream.events.off).toHaveBeenCalledWith(0);
+      expect(ctrl.preparePayload({ text: "hello again" })).toEqual({ text: "hello again" });
     });
 
     it("does not redeliver an acknowledged final when stream close produces no activity", async () => {
@@ -699,6 +951,7 @@ describe("createTeamsReplyStreamController", () => {
       await expect(ctrl.finalize()).resolves.toEqual({
         visibleReplySent: true,
         content: "hello",
+        messageId: "stream-acknowledged",
       });
       expect(stream.events.off).toHaveBeenCalledWith(0);
     });
@@ -715,6 +968,7 @@ describe("createTeamsReplyStreamController", () => {
       await expect(ctrl.finalize()).resolves.toEqual({
         visibleReplySent: true,
         content: "hello",
+        messageId: "stream-acknowledged",
       });
       expect(stream.events.off).toHaveBeenCalledWith(0);
     });
@@ -739,8 +993,7 @@ describe("createTeamsReplyStreamController", () => {
       // Finalize must not propagate; it returns the retained payload so the
       // dispatcher can fall back to normal Teams delivery.
       await expect(ctrl.finalize()).resolves.toEqual({
-        visibleReplySent: true,
-        content: "partial final",
+        visibleReplySent: false,
         fallbackPayload: { text: "partial final" },
       });
     });

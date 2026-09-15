@@ -4,7 +4,7 @@ import { beforeAll, describe, it } from "vitest";
  *
  * Installs surface, directory, threading, and plugin contract suites for bundled channel shards.
  */
-import { expectChannelPluginContract } from "../../../../plugin-sdk/channel-test-helpers.js";
+import { expectChannelPluginContract } from "../../../../plugin-sdk/test-helpers/channel-contract-suites.js";
 import {
   getBundledChannelDirectoryPluginAsync,
   getBundledChannelPluginAsync,
@@ -58,7 +58,9 @@ export function installSurfaceContractRegistryShard(params: ContractShardParams)
         if (!plugin) {
           throw new Error(`Missing bundled channel plugin for ${id}`);
         }
-        const surfaces = channelPluginSurfaceKeys.filter((surface) => Boolean(plugin[surface]));
+        const surfaces = channelPluginSurfaceKeys.filter((surface) =>
+          Boolean(surface === "setup" ? (plugin.setupContract ?? plugin.setup) : plugin[surface]),
+        );
         for (const surface of surfaces) {
           expectChannelSurfaceContract({
             plugin,

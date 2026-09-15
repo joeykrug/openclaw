@@ -83,7 +83,28 @@ describe("signalCheck", () => {
     await expect(
       signalCheck("http://container:8080", 5_000, { transportKind: "container" }),
     ).resolves.toEqual({ ok: true, status: 200 });
-    expect(containerCheck).toHaveBeenCalledWith("http://container:8080", 5_000);
+    expect(containerCheck).toHaveBeenCalledWith("http://container:8080", 5_000, undefined);
+    expect(nativeCheck).not.toHaveBeenCalled();
+  });
+
+  it("validates the configured container account's receive WebSocket", async () => {
+    containerCheck.mockResolvedValue({
+      ok: false,
+      status: 200,
+      error: "Signal container receive endpoint did not upgrade to WebSocket (HTTP 200)",
+    });
+
+    await expect(
+      signalCheck("http://container:8080", 5_000, {
+        transportKind: "container",
+        account: "+15550001111",
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      status: 200,
+      error: "Signal container receive endpoint did not upgrade to WebSocket (HTTP 200)",
+    });
+    expect(containerCheck).toHaveBeenCalledWith("http://container:8080", 5_000, "+15550001111");
     expect(nativeCheck).not.toHaveBeenCalled();
   });
 });
@@ -94,6 +115,7 @@ describe("streamSignalEvents", () => {
       params.onEvent({ event: "receive", data: "native" });
     });
     const onEvent = vi.fn();
+    const onStreamOpen = vi.fn();
 
     await streamSignalEvents({
       baseUrl: "http://native:8080",
@@ -101,6 +123,7 @@ describe("streamSignalEvents", () => {
       transportKind: "managed-native",
       timeoutMs: 0,
       onEvent,
+      onStreamOpen,
     });
 
     expect(nativeStream).toHaveBeenCalledWith(
@@ -108,35 +131,44 @@ describe("streamSignalEvents", () => {
         baseUrl: "http://native:8080",
         account: "+15555550123",
         timeoutMs: 0,
+        onStreamOpen,
       }),
     );
     expect(onEvent).toHaveBeenCalledWith({ event: "receive", data: "native" });
     expect(containerStream).not.toHaveBeenCalled();
   });
 
-  it("uses the container WebSocket and converts its event shape", async () => {
-    containerStream.mockImplementation(async (params) => {
-      params.onEvent({ envelope: { sourceNumber: "+15555550124" } });
-    });
-    const onEvent = vi.fn();
+  it.each([undefined, 0, 200, 60_000])(
+    "forwards container timeout %s and converts its event shape",
+    async (timeoutMs) => {
+      containerStream.mockImplementation(async (params) => {
+        params.onEvent({ envelope: { sourceNumber: "+15555550124" } });
+      });
+      const onEvent = vi.fn();
+      const onStreamOpen = vi.fn();
 
-    await streamSignalEvents({
-      baseUrl: "http://container:8080",
-      account: "+15555550123",
-      transportKind: "container",
-      onEvent,
-    });
-
-    expect(containerStream).toHaveBeenCalledWith(
-      expect.objectContaining({
+      await streamSignalEvents({
         baseUrl: "http://container:8080",
         account: "+15555550123",
-      }),
-    );
-    expect(onEvent).toHaveBeenCalledWith({
-      event: "receive",
-      data: JSON.stringify({ envelope: { sourceNumber: "+15555550124" } }),
-    });
-    expect(nativeStream).not.toHaveBeenCalled();
-  });
+        transportKind: "container",
+        timeoutMs,
+        onEvent,
+        onStreamOpen,
+      });
+
+      expect(containerStream).toHaveBeenCalledWith(
+        expect.objectContaining({
+          baseUrl: "http://container:8080",
+          account: "+15555550123",
+          timeoutMs,
+          onStreamOpen,
+        }),
+      );
+      expect(onEvent).toHaveBeenCalledWith({
+        event: "receive",
+        data: JSON.stringify({ envelope: { sourceNumber: "+15555550124" } }),
+      });
+      expect(nativeStream).not.toHaveBeenCalled();
+    },
+  );
 });

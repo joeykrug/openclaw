@@ -3,20 +3,26 @@ import {
   executeSqliteQuerySync,
   executeSqliteQueryTakeFirstSync,
 } from "../../infra/kysely-sync.js";
+import { coerceRequiredSqliteNumber as sqliteNumber } from "../../infra/sqlite-number.js";
 import { runSqliteDeferredTransactionSync } from "../../infra/sqlite-transaction.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import type { CurrentTranscriptProjection } from "./session-accessor.sqlite-active-projection.js";
 import type {
   SessionTranscriptRawDeltaLimits,
   SessionTranscriptRawDeltaResult,
   SessionTranscriptReadScope,
-  TranscriptEvent,
 } from "./session-accessor.sqlite-contract.js";
-import { normalizeSqliteNumber } from "./session-accessor.sqlite-normalize.js";
 import {
   getSessionKysely,
   resolveSqliteTranscriptReadScope,
   toDatabaseOptions,
 } from "./session-accessor.sqlite-scope.js";
+import { normalizeVisibleMessageLimit } from "./session-accessor.sqlite-visible-cursor.js";
+import { assertSessionTranscriptHot } from "./session-cold-storage-state.js";
+import {
+  resolveSqliteSessionTranscriptReadFence,
+  SessionTranscriptReadFenceError,
+} from "./session-transcript-read-fence.js";
 
 const RAW_TRANSCRIPT_CURSOR_VERSION = 1;
 const DEFAULT_RAW_TRANSCRIPT_MAX_EVENTS = 1_000;
@@ -32,23 +38,22 @@ type RawTranscriptCursor = {
   version: typeof RAW_TRANSCRIPT_CURSOR_VERSION;
 };
 
-type ResolvedTranscriptReadScope = ReturnType<typeof resolveSqliteTranscriptReadScope>;
+type SessionTranscriptRawDeltaPage = Extract<SessionTranscriptRawDeltaResult, { kind: "page" }>;
 
-function normalizeRawDeltaLimit(
-  value: number | undefined,
-  fallback: number,
-  maximum: number,
-  name: string,
-): number {
-  const resolved = value ?? fallback;
-  if (!Number.isInteger(resolved) || resolved < 1 || resolved > maximum) {
-    throw new RangeError(`${name} must be an integer between 1 and ${String(maximum)}`);
-  }
-  return resolved;
-}
+type ResolvedTranscriptReadScope = ReturnType<typeof resolveSqliteTranscriptReadScope>;
 
 function encodeRawTranscriptCursor(cursor: RawTranscriptCursor): string {
   return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+/** Mint the raw-delta cursor for a generation-consistent transcript snapshot. */
+export function createTranscriptRawDeltaCursor(params: {
+  agentId: string;
+  generation: string;
+  lastSeq: number;
+  sessionId: string;
+}): string {
+  return encodeRawTranscriptCursor({ ...params, version: RAW_TRANSCRIPT_CURSOR_VERSION });
 }
 
 function parseRawTranscriptCursor(value: string): RawTranscriptCursor | undefined {
@@ -88,32 +93,72 @@ function bootstrapCursor(
   };
 }
 
-/** Read one generation-consistent raw transcript page without parsing excluded payload rows. */
-export function readSqliteTranscriptRawDelta(
-  scope: SessionTranscriptReadScope,
-  limits: SessionTranscriptRawDeltaLimits = {},
-): SessionTranscriptRawDeltaResult {
-  const resolved = resolveSqliteTranscriptReadScope(scope);
-  const maxEvents = normalizeRawDeltaLimit(
+function normalizeRawDeltaLimits(limits: SessionTranscriptRawDeltaLimits) {
+  const maxEvents = normalizeVisibleMessageLimit(
     limits.maxEvents,
     DEFAULT_RAW_TRANSCRIPT_MAX_EVENTS,
     MAX_RAW_TRANSCRIPT_EVENTS,
     "maxEvents",
   );
-  const maxBytes = normalizeRawDeltaLimit(
+  const maxBytes = normalizeVisibleMessageLimit(
     limits.maxBytes,
     DEFAULT_RAW_TRANSCRIPT_MAX_BYTES,
     MAX_RAW_TRANSCRIPT_BYTES,
     "maxBytes",
   );
+  return { maxEvents, maxBytes };
+}
+
+/** Read one generation-consistent raw transcript page without parsing excluded payload rows. */
+export function readTranscriptRawDelta(
+  scope: SessionTranscriptReadScope,
+  limits: SessionTranscriptRawDeltaLimits = {},
+): SessionTranscriptRawDeltaResult {
+  const resolved = resolveSqliteTranscriptReadScope(scope);
+  const { maxEvents, maxBytes } = normalizeRawDeltaLimits(limits);
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
   return runSqliteDeferredTransactionSync(
     database.db,
-    () => readRawDeltaInTransaction(database.db, resolved, limits.cursor, maxEvents, maxBytes),
+    () => {
+      assertSessionTranscriptHot(database.db, resolved.sessionId);
+      const beforeEventSeq = resolveSqliteSessionTranscriptReadFence({
+        database,
+        ...resolved,
+      })?.beforeRawSeq;
+      return readRawDeltaInTransaction(
+        database.db,
+        resolved,
+        limits.cursor,
+        maxEvents,
+        maxBytes,
+        beforeEventSeq,
+      );
+    },
     {
       databaseLabel: database.path,
       operationLabel: "session transcript raw delta",
     },
+  );
+}
+
+/** Read inside the caller's validated projection snapshot on its exact connection. */
+export function readTranscriptRawDeltaFromProjection(
+  projection: CurrentTranscriptProjection,
+  limits: SessionTranscriptRawDeltaLimits = {},
+): SessionTranscriptRawDeltaResult {
+  const { maxEvents, maxBytes } = normalizeRawDeltaLimits(limits);
+  const beforeEventSeq = resolveSqliteSessionTranscriptReadFence({
+    database: projection.database,
+    ...projection.resolved,
+  })?.beforeRawSeq;
+  return readRawDeltaInTransaction(
+    projection.database.db,
+    projection.resolved,
+    limits.cursor,
+    maxEvents,
+    maxBytes,
+    beforeEventSeq,
+    { generation: projection.generation, indexedSeq: projection.state.indexedSeq },
   );
 }
 
@@ -123,20 +168,24 @@ function readRawDeltaInTransaction(
   encodedCursor: string | undefined,
   maxEvents: number,
   maxBytes: number,
+  beforeEventSeq: number | undefined,
+  snapshot?: { generation: string | undefined; indexedSeq: number },
 ): SessionTranscriptRawDeltaResult {
   const db = getSessionKysely(database);
-  const state = executeSqliteQueryTakeFirstSync(
-    database,
-    db
-      .selectFrom("transcript_rewrite_watermarks")
-      .select("generation")
-      .where("session_id", "=", scope.sessionId),
-  );
-  if (!state) {
+  const generation = snapshot
+    ? snapshot.generation
+    : executeSqliteQueryTakeFirstSync(
+        database,
+        db
+          .selectFrom("transcript_rewrite_watermarks")
+          .select("generation")
+          .where("session_id", "=", scope.sessionId),
+      )?.generation;
+  if (generation === undefined) {
     return { kind: "missing" };
   }
 
-  const initialCursor = bootstrapCursor(scope, state.generation);
+  const initialCursor = bootstrapCursor(scope, generation);
   const reset = (
     reason: Extract<SessionTranscriptRawDeltaResult, { kind: "reset" }>["reason"],
   ) => ({
@@ -152,40 +201,54 @@ function readRawDeltaInTransaction(
   if (cursor.agentId !== scope.agentId || cursor.sessionId !== scope.sessionId) {
     return reset("scope_mismatch");
   }
-  if (cursor.generation !== state.generation) {
+  if (cursor.generation !== generation) {
     return reset("generation_mismatch");
   }
-  const frontier = executeSqliteQueryTakeFirstSync(
-    database,
-    db
-      .selectFrom("transcript_events")
-      .select("seq")
-      .where("session_id", "=", scope.sessionId)
-      .orderBy("seq", "desc")
-      .limit(1),
+  const frontier = snapshot
+    ? snapshot.indexedSeq
+    : executeSqliteQueryTakeFirstSync(
+        database,
+        db
+          .selectFrom("transcript_events")
+          .select("seq")
+          .where("session_id", "=", scope.sessionId)
+          .orderBy("seq", "desc")
+          .limit(1),
+      )?.seq;
+  const maxSeq = Math.min(
+    frontier === undefined ? -1 : sqliteNumber(frontier),
+    beforeEventSeq === undefined ? Number.POSITIVE_INFINITY : beforeEventSeq - 1,
   );
-  const maxSeq = frontier ? normalizeSqliteNumber(frontier.seq) : -1;
   if (cursor.lastSeq > maxSeq) {
+    if (beforeEventSeq !== undefined) {
+      throw new SessionTranscriptReadFenceError(
+        "Transcript read cursor has crossed the current-turn admission fence",
+      );
+    }
     return reset("invalid_cursor");
   }
 
-  const metadata = executeSqliteQuerySync(
-    database,
-    db
-      .selectFrom("transcript_events")
-      .select([
-        "seq",
-        /* kysely-allow-raw: SQLite byte length avoids fetching or parsing excluded JSON. */
-        sql<number>`LENGTH(CAST(event_json AS BLOB)) + 1`.as("serialized_bytes"),
-      ])
-      .where("session_id", "=", scope.sessionId)
-      .where("seq", ">", cursor.lastSeq)
-      .orderBy("seq", "asc")
-      .limit(maxEvents + 1),
-  ).rows.map((row) => ({
-    seq: normalizeSqliteNumber(row.seq),
-    serializedBytes: normalizeSqliteNumber(row.serialized_bytes),
-  }));
+  const metadata =
+    cursor.lastSeq === maxSeq
+      ? []
+      : executeSqliteQuerySync(
+          database,
+          db
+            .selectFrom("transcript_events")
+            .select([
+              "seq",
+              /* kysely-allow-raw: SQLite byte length avoids fetching or parsing excluded JSON. */
+              sql<number>`OCTET_LENGTH(event_json) + 1`.as("serialized_bytes"),
+            ])
+            .where("session_id", "=", scope.sessionId)
+            .where("seq", ">", cursor.lastSeq)
+            .$if(beforeEventSeq !== undefined, (query) => query.where("seq", "<", beforeEventSeq!))
+            .orderBy("seq", "asc")
+            .limit(maxEvents + 1),
+        ).rows.map((row) => ({
+          seq: sqliteNumber(row.seq),
+          serializedBytes: sqliteNumber(row.serialized_bytes),
+        }));
 
   let serializedBytes = 0;
   let selectedCount = 0;
@@ -211,13 +274,13 @@ function readRawDeltaInTransaction(
             .where("seq", "<=", lastSeq)
             .orderBy("seq", "asc"),
         ).rows.map((row) => ({
-          event: JSON.parse(row.event_json) as TranscriptEvent,
-          seq: normalizeSqliteNumber(row.seq),
+          event: JSON.parse(row.event_json),
+          seq: sqliteNumber(row.seq),
         }));
   const nextCursor = encodeRawTranscriptCursor({ ...cursor, lastSeq });
   const requiredBytes =
     selectedCount === 0 && metadata[0] ? metadata[0].serializedBytes : undefined;
-  return {
+  const page: SessionTranscriptRawDeltaPage = {
     kind: "page",
     cursor: nextCursor,
     events: rows,
@@ -225,4 +288,5 @@ function readRawDeltaInTransaction(
     ...(requiredBytes !== undefined ? { requiredBytes } : {}),
     serializedBytes,
   };
+  return page;
 }

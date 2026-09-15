@@ -1,5 +1,6 @@
-// Matrix tests cover client plugin behavior.
 import { expectDefined } from "@openclaw/normalization-core";
+// Matrix tests cover client plugin behavior.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { installMatrixTestRuntime } from "../test-runtime.js";
 import type { CoreConfig } from "../types.js";
@@ -53,12 +54,7 @@ vi.mock("./client/logging.js", () => ({
   ensureMatrixSdkLoggingConfigured: authClientMocks.ensureMatrixSdkLoggingConfigured,
 }));
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null) {
-    throw new Error(`${label} was not an object`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("object", "label-not-object");
 
 function expectRecordFields(record: Record<string, unknown>, fields: Record<string, unknown>) {
   for (const [key, value] of Object.entries(fields)) {
@@ -96,6 +92,52 @@ function expectMatrixLoginCall(fields: Record<string, unknown>) {
   expect(call[2]).toBeUndefined();
   expectRecordFields(requireRecord(call[3], "Matrix login body"), fields);
 }
+
+describe("client constructor lazy loading", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.doUnmock("./client/create-client.js");
+    vi.resetModules();
+  });
+
+  it("defers constructor module evaluation and forwards each creation independently", async () => {
+    const firstClient = { id: "first client" };
+    const secondClient = { id: "second client" };
+    const failure = new Error("creation failed");
+    const createClient = vi
+      .fn()
+      .mockResolvedValueOnce(firstClient)
+      .mockResolvedValueOnce(secondClient)
+      .mockRejectedValueOnce(failure);
+    const evaluateConstructor = vi.fn(() => ({ createMatrixClient: createClient }));
+    vi.doMock("./client/create-client.js", evaluateConstructor);
+
+    const { createMatrixClient } = await import("./client.js");
+    expect(evaluateConstructor).not.toHaveBeenCalled();
+
+    const options = {
+      homeserver: "https://matrix.example.org",
+      accessToken: "synthetic-token",
+      accountId: "ops",
+      persistStorage: false,
+      encryption: true,
+      localTimeoutMs: 1234,
+    };
+    await expect(createMatrixClient(options)).resolves.toBe(firstClient);
+    const secondOptions = { ...options, accountId: "other" };
+    await expect(createMatrixClient(secondOptions)).resolves.toBe(secondClient);
+    await expect(createMatrixClient(options)).rejects.toBe(failure);
+
+    expect(createClient).toHaveBeenCalledTimes(3);
+    expect(createClient).toHaveBeenNthCalledWith(1, options);
+    expect(createClient).toHaveBeenNthCalledWith(2, secondOptions);
+    expect(createClient).toHaveBeenNthCalledWith(3, options);
+    expect(evaluateConstructor).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("resolveMatrixAuth", () => {
   beforeEach(() => {

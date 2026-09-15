@@ -1,7 +1,6 @@
 // Covers message action allowlists plus cross-context marker/decorator policy
 // for same-provider and cross-provider sends.
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChannelMessageActionName } from "../../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { CrossContextDecoration } from "./outbound-policy.js";
@@ -109,8 +108,8 @@ function expectCrossContextPolicyResult(params: {
   channel: string;
   action: ChannelMessageActionName;
   to: string;
-  currentChannelId: string;
-  currentChannelProvider: string;
+  currentChannelId?: string;
+  currentChannelProvider?: string;
   agentId?: string;
   expected: "allow" | RegExp;
 }) {
@@ -145,6 +144,38 @@ describe("outbound policy helpers", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it.each([
+    { name: "default cross-provider denial", provider: "webchat", expected: /target provider/ },
+    {
+      name: "explicit cross-provider denial",
+      provider: "webchat",
+      policy: { allowAcrossProviders: false },
+      expected: /target provider/,
+    },
+    {
+      name: "explicit cross-provider opt-in",
+      provider: "webchat",
+      policy: { allowAcrossProviders: true, allowWithinProvider: false },
+      expected: "allow" as const,
+    },
+    {
+      name: "same-provider targetless context",
+      provider: "discord",
+      policy: { allowWithinProvider: false },
+      expected: "allow" as const,
+    },
+    { name: "unbound context", provider: undefined, expected: "allow" as const },
+  ])("preserves $name without a current target", ({ provider, policy, expected }) => {
+    expectCrossContextPolicyResult({
+      cfg: { tools: { message: { crossContext: policy } } },
+      channel: "discord",
+      action: "send",
+      to: "channel:123",
+      currentChannelProvider: provider,
+      expected,
+    });
   });
 
   it.each([
@@ -229,7 +260,15 @@ describe("outbound policy helpers", () => {
     expectCrossContextPolicyResult(params);
   });
 
-  it.each(["edit", "delete", "pin", "unpin", "poll-vote"] satisfies ChannelMessageActionName[])(
+  it.each([
+    "edit",
+    "delete",
+    "pin",
+    "unpin",
+    "poll-vote",
+    "topic-create",
+    "topic-edit",
+  ] satisfies ChannelMessageActionName[])(
     "blocks cross-provider %s actions by default",
     (action) => {
       expectCrossContextPolicyResult({
@@ -244,7 +283,14 @@ describe("outbound policy helpers", () => {
     },
   );
 
-  it.each(["edit", "delete", "pin", "unpin"] satisfies ChannelMessageActionName[])(
+  it.each([
+    "edit",
+    "delete",
+    "pin",
+    "unpin",
+    "topic-create",
+    "topic-edit",
+  ] satisfies ChannelMessageActionName[])(
     "allows cross-provider %s actions when explicitly enabled",
     (action) => {
       expectCrossContextPolicyResult({
@@ -264,7 +310,14 @@ describe("outbound policy helpers", () => {
     },
   );
 
-  it.each(["edit", "delete", "pin", "unpin"] satisfies ChannelMessageActionName[])(
+  it.each([
+    "edit",
+    "delete",
+    "pin",
+    "unpin",
+    "topic-create",
+    "topic-edit",
+  ] satisfies ChannelMessageActionName[])(
     "allows current-context %s actions without cross-provider opt-in",
     (action) => {
       expectCrossContextPolicyResult({
@@ -349,6 +402,8 @@ describe("outbound policy helpers", () => {
     { action: "upload-file", expected: true },
     { action: "thread-reply", expected: true },
     { action: "thread-create", expected: false },
+    { action: "topic-create", expected: false },
+    { action: "topic-edit", expected: false },
   ] satisfies Array<{ action: ChannelMessageActionName; expected: boolean }>)(
     "marks supported cross-context action %j",
     ({ action, expected }) => {

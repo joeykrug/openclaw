@@ -7,7 +7,7 @@ import {
 } from "./api.js";
 import { mistralMediaUnderstandingProvider } from "./media-understanding-provider.js";
 import { mistralMemoryEmbeddingProviderAdapter } from "./memory-embedding-adapter.js";
-import { applyMistralConfig } from "./onboard.js";
+import { applyMistralConnectionConfig } from "./onboard.js";
 import manifest from "./openclaw.plugin.json" with { type: "json" };
 import { buildMistralRealtimeTranscriptionProvider } from "./realtime-transcription-provider.js";
 
@@ -22,13 +22,14 @@ function buildMistralReplayPolicy() {
 export default defineSingleProviderPluginEntry({
   id: PROVIDER_ID,
   name: "Mistral Provider",
-  description: "Bundled Mistral provider plugin",
+  description: "Official Mistral provider plugin",
   manifest,
   provider: {
     label: "Mistral",
     docsPath: "/providers/models",
-    manifestAuth: { applyConfig: applyMistralConfig },
+    manifestAuth: { applyConfig: applyMistralConnectionConfig },
     catalog: {
+      discoveryMode: "strict",
       allowExplicitBaseUrl: true,
       liveModelDiscovery: true,
     },
@@ -44,7 +45,7 @@ export default defineSingleProviderPluginEntry({
     buildReplayPolicy: () => buildMistralReplayPolicy(),
   },
   register(api) {
-    api.registerMemoryEmbeddingProvider(mistralMemoryEmbeddingProviderAdapter);
+    api.registerEmbeddingProvider(mistralMemoryEmbeddingProviderAdapter);
     api.registerMediaUnderstandingProvider(mistralMediaUnderstandingProvider);
     api.registerRealtimeTranscriptionProvider(buildMistralRealtimeTranscriptionProvider());
   },

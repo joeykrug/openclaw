@@ -54,35 +54,28 @@ describe("openrouter-model-capabilities", () => {
     await withOpenRouterStateDir(async () => {
       vi.stubGlobal(
         "fetch",
-        vi.fn(
-          async () =>
-            new Response(
-              JSON.stringify({
-                data: [
-                  {
-                    id: "acme/top-level-max-completion",
-                    name: "Top Level Max Completion",
-                    architecture: { modality: "text+image->text" },
-                    supported_parameters: ["reasoning", "tools"],
-                    context_length: 65432,
-                    max_completion_tokens: 12345,
-                    pricing: { prompt: "0.000001", completion: "0.000002" },
-                  },
-                  {
-                    id: "acme/top-level-max-output",
-                    name: "Top Level Max Output",
-                    modality: "text+image->text",
-                    context_length: 54321,
-                    max_output_tokens: 23456,
-                    pricing: { prompt: "0.000003", completion: "0.000004" },
-                  },
-                ],
-              }),
+        vi.fn(async () =>
+          Response.json({
+            data: [
               {
-                status: 200,
-                headers: { "content-type": "application/json" },
+                id: "acme/top-level-max-completion",
+                name: "Top Level Max Completion",
+                architecture: { modality: "text+image->text" },
+                supported_parameters: ["reasoning", "tools"],
+                context_length: 65432,
+                max_completion_tokens: 12345,
+                pricing: { prompt: "0.000001", completion: "0.000002" },
               },
-            ),
+              {
+                id: "acme/top-level-max-output",
+                name: "Top Level Max Output",
+                modality: "text+image->text",
+                context_length: 54321,
+                max_output_tokens: 23456,
+                pricing: { prompt: "0.000003", completion: "0.000004" },
+              },
+            ],
+          }),
         ),
       );
 
@@ -124,29 +117,22 @@ describe("openrouter-model-capabilities", () => {
     await withOpenRouterStateDir(async () => {
       vi.stubGlobal(
         "fetch",
-        vi.fn(
-          async () =>
-            new Response(
-              JSON.stringify({
-                data: [
-                  {
-                    id: "nvidia/nemotron-3-super-120b-a12b:free",
-                    name: "Nemotron 3 Super 120B Free",
-                    architecture: { modality: "text->text" },
-                    context_length: 1_000_000,
-                    top_provider: {
-                      context_length: 262_144,
-                      max_completion_tokens: 262_144,
-                    },
-                    pricing: { prompt: "0", completion: "0" },
-                  },
-                ],
-              }),
+        vi.fn(async () =>
+          Response.json({
+            data: [
               {
-                status: 200,
-                headers: { "content-type": "application/json" },
+                id: "nvidia/nemotron-3-super-120b-a12b:free",
+                name: "Nemotron 3 Super 120B Free",
+                architecture: { modality: "text->text" },
+                context_length: 1_000_000,
+                top_provider: {
+                  context_length: 262_144,
+                  max_completion_tokens: 262_144,
+                },
+                pricing: { prompt: "0", completion: "0" },
               },
-            ),
+            ],
+          }),
         ),
       );
 
@@ -191,29 +177,22 @@ describe("openrouter-model-capabilities", () => {
         }),
       );
 
-      const fetchSpy = vi.fn(
-        async () =>
-          new Response(
-            JSON.stringify({
-              data: [
-                {
-                  id: modelId,
-                  name: "Nemotron 3 Super 120B Free",
-                  architecture: { modality: "text->text" },
-                  context_length: 1_000_000,
-                  top_provider: {
-                    context_length: 262_144,
-                    max_completion_tokens: 262_144,
-                  },
-                  pricing: { prompt: "0", completion: "0" },
-                },
-              ],
-            }),
+      const fetchSpy = vi.fn(async () =>
+        Response.json({
+          data: [
             {
-              status: 200,
-              headers: { "content-type": "application/json" },
+              id: modelId,
+              name: "Nemotron 3 Super 120B Free",
+              architecture: { modality: "text->text" },
+              context_length: 1_000_000,
+              top_provider: {
+                context_length: 262_144,
+                max_completion_tokens: 262_144,
+              },
+              pricing: { prompt: "0", completion: "0" },
             },
-          ),
+          ],
+        }),
       );
       vi.stubGlobal("fetch", fetchSpy);
 
@@ -228,34 +207,63 @@ describe("openrouter-model-capabilities", () => {
     });
   });
 
-  it("loads cached OpenRouter capabilities from SQLite on the next import", async () => {
+  it("preserves partial native OpenRouter pricing overrides in memory and across SQLite reads", async () => {
     await withOpenRouterStateDir(async () => {
-      const fetchSpy = vi.fn(
-        async () =>
-          new Response(
-            JSON.stringify({
-              data: [
-                {
-                  id: "acme/sqlite-cached-model",
-                  name: "SQLite Cached Model",
-                  architecture: { modality: "text+image->text" },
-                  supported_parameters: ["tools"],
-                  context_length: 8765,
-                  max_completion_tokens: 4321,
-                  pricing: { prompt: "0.000005", completion: "0.000006" },
-                },
-              ],
-            }),
+      const cost = {
+        input: 2,
+        output: 10,
+        cacheRead: expect.closeTo(0.2, 12),
+        cacheWrite: 2.5,
+        tieredPricing: [
+          {
+            input: 2,
+            output: 10,
+            cacheRead: expect.closeTo(0.2, 12),
+            cacheWrite: 2.5,
+            range: [0, 272_001],
+          },
+          {
+            input: 4,
+            output: 10,
+            cacheRead: expect.closeTo(0.2, 12),
+            cacheWrite: 2.5,
+            range: [272_001],
+          },
+        ],
+      };
+      const fetchSpy = vi.fn(async () =>
+        Response.json({
+          data: [
             {
-              status: 200,
-              headers: { "content-type": "application/json" },
+              id: "acme/sqlite-cached-model",
+              name: "SQLite Cached Model",
+              architecture: { modality: "text+image->text" },
+              supported_parameters: ["tools"],
+              context_length: 8765,
+              max_completion_tokens: 4321,
+              pricing: {
+                prompt: "0.000002",
+                completion: "0.00001",
+                input_cache_read: "0.0000002",
+                input_cache_write: "0.0000025",
+                overrides: [
+                  {
+                    min_prompt_tokens: 272_000,
+                    prompt: "0.000004",
+                  },
+                ],
+              },
             },
-          ),
+          ],
+        }),
       );
       vi.stubGlobal("fetch", fetchSpy);
 
       const firstModule = await importOpenRouterModelCapabilities("sqlite-cache-writer");
       await firstModule.loadOpenRouterModelCapabilities("acme/sqlite-cached-model");
+      expect(firstModule.getOpenRouterModelCapabilities("acme/sqlite-cached-model")?.cost).toEqual(
+        cost,
+      );
       expect(fetchSpy).toHaveBeenCalledTimes(1);
 
       const secondModule = await importOpenRouterModelCapabilities("sqlite-cache-reader");
@@ -265,9 +273,69 @@ describe("openrouter-model-capabilities", () => {
           supportsTools: true,
           contextWindow: 8765,
           maxTokens: 4321,
+          cost,
         },
       );
       expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it.each([
+    ["missing data", {}],
+    ["non-array data", { data: {} }],
+  ])("preserves cached capabilities when a refresh has %s", async (_label, malformedPayload) => {
+    await withOpenRouterStateDir(async () => {
+      const modelId = "acme/healthy-model";
+      const fetchSpy = vi
+        .fn()
+        .mockResolvedValueOnce(
+          Response.json({
+            data: [
+              {
+                id: modelId,
+                name: "Healthy Model",
+                context_length: 8192,
+              },
+            ],
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify(malformedPayload), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const writer = await importOpenRouterModelCapabilities(`malformed-writer-${_label}`);
+      await writer.loadOpenRouterModelCapabilities(modelId);
+      await writer.loadOpenRouterModelCapabilities("acme/new-model");
+
+      expect(writer.getOpenRouterModelCapabilities(modelId)?.name).toBe("Healthy Model");
+      const reader = await importOpenRouterModelCapabilities(`malformed-reader-${_label}`);
+      expect(reader.getOpenRouterModelCapabilities(modelId)?.name).toBe("Healthy Model");
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("treats an explicit empty catalog as an authoritative replacement", async () => {
+    await withOpenRouterStateDir(async () => {
+      const modelId = "acme/removed-model";
+      const fetchSpy = vi
+        .fn()
+        .mockResolvedValueOnce(
+          Response.json({
+            data: [{ id: modelId, name: "Removed Model", context_length: 8192 }],
+          }),
+        )
+        .mockResolvedValueOnce(Response.json({ data: [] }));
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const module = await importOpenRouterModelCapabilities("authoritative-empty");
+      await module.loadOpenRouterModelCapabilities(modelId);
+      await module.loadOpenRouterModelCapabilities("acme/new-model");
+
+      expect(module.getOpenRouterModelCapabilities(modelId)).toBeUndefined();
     });
   });
 
@@ -275,28 +343,21 @@ describe("openrouter-model-capabilities", () => {
     await withOpenRouterStateDir(async () => {
       vi.stubGlobal(
         "fetch",
-        vi.fn(
-          async () =>
-            new Response(
-              JSON.stringify({
-                data: [
-                  {
-                    id: "perplexity/sonar-deep-research",
-                    name: "Sonar Deep Research",
-                    supported_parameters: ["reasoning", "web_search_options"],
-                  },
-                  {
-                    id: "google/gemini-2.5-pro",
-                    name: "Gemini 2.5 Pro",
-                    supported_parameters: ["reasoning", "tools"],
-                  },
-                ],
-              }),
+        vi.fn(async () =>
+          Response.json({
+            data: [
               {
-                status: 200,
-                headers: { "content-type": "application/json" },
+                id: "perplexity/sonar-deep-research",
+                name: "Sonar Deep Research",
+                supported_parameters: ["reasoning", "web_search_options"],
               },
-            ),
+              {
+                id: "google/gemini-2.5-pro",
+                name: "Gemini 2.5 Pro",
+                supported_parameters: ["reasoning", "tools"],
+              },
+            ],
+          }),
         ),
       );
 
@@ -412,24 +473,17 @@ describe("openrouter-model-capabilities", () => {
 
   it("does not refetch immediately after an awaited miss for the same model id", async () => {
     await withOpenRouterStateDir(async () => {
-      const fetchSpy = vi.fn(
-        async () =>
-          new Response(
-            JSON.stringify({
-              data: [
-                {
-                  id: "acme/known-model",
-                  name: "Known Model",
-                  architecture: { modality: "text->text" },
-                  context_length: 1234,
-                },
-              ],
-            }),
+      const fetchSpy = vi.fn(async () =>
+        Response.json({
+          data: [
             {
-              status: 200,
-              headers: { "content-type": "application/json" },
+              id: "acme/known-model",
+              name: "Known Model",
+              architecture: { modality: "text->text" },
+              context_length: 1234,
             },
-          ),
+          ],
+        }),
       );
       vi.stubGlobal("fetch", fetchSpy);
 

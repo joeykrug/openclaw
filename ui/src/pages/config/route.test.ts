@@ -14,7 +14,16 @@ import { pages } from "./route.ts";
 
 type RouteModule = { header: boolean; render: () => unknown };
 
-const removedGeneralPage = pages[0] as PageDefinition<RouteId, ApplicationContext, RouteModule>;
+const removedGeneralPage = pages.find((page) => page.id === "config") as PageDefinition<
+  RouteId,
+  ApplicationContext,
+  RouteModule
+>;
+const updatesPage = pages.find((page) => page.id === "updates") as PageDefinition<
+  RouteId,
+  ApplicationContext,
+  RouteModule
+>;
 
 function locationFromUrl(url: string): RouteLocation {
   const parsed = new URL(url, "https://control.test");
@@ -110,5 +119,45 @@ describe("removed General route", () => {
     } finally {
       router.stop();
     }
+  });
+});
+
+describe("Updates route", () => {
+  it("loads readable config without requesting the admin-only schema", async () => {
+    const ensureLoaded = vi.fn(() => Promise.resolve());
+    const ensureSchemaLoaded = vi.fn(() => Promise.resolve());
+    const context = {
+      runtimeConfig: { ensureLoaded, ensureSchemaLoaded },
+    } as unknown as ApplicationContext;
+    const location = locationFromUrl("/settings/updates");
+
+    await updatesPage.loader?.(context, loaderOptions(location));
+    await Promise.resolve();
+
+    expect(ensureLoaded).toHaveBeenCalledOnce();
+    expect(ensureSchemaLoaded).not.toHaveBeenCalled();
+  });
+});
+
+describe("Memory route selection intent", () => {
+  it("captures intent before config loading and changes the cache key for a newer choice", async () => {
+    const memoryPage = pages.find((page) => page.id === "memory")!;
+    const selection = { intentRevision: 3 };
+    const context = {
+      settingsAgentSelection: selection,
+      runtimeConfig: {
+        ensureLoaded: vi.fn(() => {
+          selection.intentRevision += 1;
+          return Promise.resolve();
+        }),
+        ensureSchemaLoaded: vi.fn(() => Promise.resolve()),
+      },
+    } as unknown as ApplicationContext;
+    const location = locationFromUrl("/settings/memory?agent=research");
+    const previousKey = memoryPage.loaderDeps?.(context, location);
+    const data = await memoryPage.loader?.(context, loaderOptions(location));
+
+    expect(data).toMatchObject({ agentSelectionIntent: { owner: selection, revision: 3 } });
+    expect(memoryPage.loaderDeps?.(context, location)).not.toBe(previousKey);
   });
 });

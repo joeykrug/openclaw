@@ -4,6 +4,18 @@ import { stripSuppressedControlReplyToken } from "./control-reply-text.js";
 import { projectLiveAssistantBufferedText } from "./live-chat-projector.js";
 
 describe("control reply display projection", () => {
+  it.each(["NO_", "ANNOUNCE_", "REPLY_"])(
+    "holds whitespace-padded %s prefixes while streaming",
+    (prefix) => {
+      const text = `${" \t\n".repeat(10)}${prefix}\u00a0\ufeff`;
+      expect(projectLiveAssistantBufferedText(text)).toEqual({
+        text,
+        suppress: true,
+        pendingLeadFragment: true,
+      });
+    },
+  );
+
   it("preserves text whitespace when no control token is present", () => {
     expect(stripSuppressedControlReplyToken("  keep padded  ")).toBe("  keep padded  ");
     expect(
@@ -23,7 +35,20 @@ describe("control reply display projection", () => {
     };
 
     expect(stripSuppressedControlReplyToken("NO_REPLY")).toBe("");
-    expect(projectChatDisplayMessages([message])).toEqual([message]);
+    expect(projectChatDisplayMessages([message])).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "NO_REPLY" },
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/png" },
+            omitted: true,
+            bytes: 2,
+          },
+        ],
+      },
+    ]);
   });
 
   it("strips a standalone control token beside visible text", () => {
@@ -79,38 +104,6 @@ describe("control reply display projection", () => {
         content: [{ type: "text", text: "The handoff is complete." }],
       },
     ]);
-  });
-
-  it("strips a trailing control token after removing inline directives", () => {
-    expect(
-      projectChatDisplayMessages([
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "text",
-              text: "The handoff is complete.\n\nREPLY_SKIP [[audio_as_voice]]",
-            },
-          ],
-        },
-      ]),
-    ).toEqual([
-      {
-        role: "assistant",
-        content: [{ type: "text", text: "The handoff is complete." }],
-      },
-    ]);
-  });
-
-  it("hides a control-only reply with an inline directive", () => {
-    expect(
-      projectChatDisplayMessages([
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "NO_REPLY [[audio_as_voice]]" }],
-        },
-      ]),
-    ).toEqual([]);
   });
 
   it("hides a control-only reply that also contains model thinking", () => {

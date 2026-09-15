@@ -1,7 +1,9 @@
 // Openai tests cover provider policy api plugin behavior.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  isResponseModelEquivalent,
   normalizeModelCatalogId,
+  projectRealtimeVoicePublicProjection,
   resolveModelRoutes,
   resolveThinkingProfile,
 } from "./provider-policy-api.js";
@@ -14,6 +16,50 @@ describe("OpenAI provider policy artifact", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
   });
+
+  it("projects private realtime model routing without exposing the model", () => {
+    const config = { model: "gpt-live-test-canary", voice: "marin" };
+
+    expect(projectRealtimeVoicePublicProjection({ providerConfig: config, config })).toEqual({
+      config: { voice: "marin" },
+      clientHints: {
+        modelSource: "gateway",
+        gatewayRelaySupported: false,
+      },
+    });
+  });
+
+  it("does not add routing hints for public realtime models", () => {
+    const config = { model: "gpt-realtime", voice: "marin" };
+
+    expect(projectRealtimeVoicePublicProjection({ providerConfig: config, config })).toEqual({
+      config,
+    });
+  });
+
+  it("preserves the released realtime route without routing hints", () => {
+    const config = { model: "gpt-live-1-codex", voice: "spruce" };
+
+    expect(projectRealtimeVoicePublicProjection({ providerConfig: config, config })).toEqual({
+      config,
+    });
+  });
+
+  it.each([
+    ["openai", "gpt-5.6", "gpt-5.6-sol", true],
+    ["openai", "gpt-5.6", "gpt-5.6-terra", false],
+    ["openai", "gpt-5.6", "gpt-5.6-luna", false],
+    ["openai", "gpt-5.6-sol", "gpt-5.6", false],
+    ["openai", "gpt-5.5", "gpt-5.6-sol", false],
+    ["anthropic", "gpt-5.6", "gpt-5.6-sol", false],
+  ])(
+    "declares response-model equivalence for %s/%s -> %s as %s",
+    (provider, requestedModelId, responseModelId, expected) => {
+      expect(isResponseModelEquivalent({ provider, requestedModelId, responseModelId })).toBe(
+        expected,
+      );
+    },
+  );
 
   it("normalizes the legacy Codex model alias at the provider boundary", () => {
     expect(normalizeModelCatalogId({ provider: " OpenAI ", modelId: "openai/GPT-5.4-CODEX" })).toBe(
@@ -75,6 +121,9 @@ describe("OpenAI provider policy artifact", () => {
   });
 
   it.each([
+    ["gpt-6-astra", "codex", "medium"],
+    ["gpt-6-astra", "openclaw", "medium"],
+    ["gpt-6-astra", "auto", "medium"],
     ["gpt-5.6-sol", "codex", "medium"],
     ["gpt-5.6-sol", "openclaw", "medium"],
     ["gpt-5.6-terra", "codex", "medium"],
@@ -91,7 +140,7 @@ describe("OpenAI provider policy artifact", () => {
     expect(profile?.defaultLevel).toBe(expected);
   });
 
-  it.each(["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])(
+  it.each(["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"])(
     "exposes logical Ultra for %s on the OpenClaw runtime",
     (modelId) => {
       const levels = resolveThinkingProfile({
@@ -104,7 +153,7 @@ describe("OpenAI provider policy artifact", () => {
     },
   );
 
-  it.each(["gpt-5.6-sol", "gpt-5.6-terra"])(
+  it.each(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"])(
     "uses native Ultra fallback for %s when model/list metadata is unavailable",
     (modelId) => {
       const levels = resolveThinkingProfile({
@@ -117,7 +166,7 @@ describe("OpenAI provider policy artifact", () => {
     },
   );
 
-  it.each(["gpt-5.6-sol", "gpt-5.6-terra"])(
+  it.each(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"])(
     "keeps native Ultra fallback for %s with direct OpenAI API metadata",
     (modelId) => {
       const levels = resolveThinkingProfile({
@@ -147,13 +196,13 @@ describe("OpenAI provider policy artifact", () => {
     }
   });
 
-  it("lets authoritative Codex model/list metadata override native fallbacks", () => {
+  it("merges partial Codex model/list metadata with known native capabilities", () => {
     const solLevels = resolveThinkingProfile({
       provider: "openai",
       modelId: "gpt-5.6-sol",
       agentRuntime: "codex",
       api: "openai-chatgpt-responses",
-      compat: { supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"] },
+      compat: { supportedReasoningEfforts: ["low", "high"] },
     })?.levels.map((level) => level.id);
     const terraLevels = resolveThinkingProfile({
       provider: "openai",
@@ -165,44 +214,51 @@ describe("OpenAI provider policy artifact", () => {
       },
     })?.levels.map((level) => level.id);
 
-    expect(solLevels).not.toContain("ultra");
-    expect(terraLevels).toContain("ultra");
+    expect(solLevels).toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+    expect(terraLevels).toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
   });
 
   it.each([
-    { efforts: [], expected: ["off"] },
-    { efforts: ["high"], expected: ["off", "high"] },
-  ])("uses the complete authoritative Codex effort list for $efforts", ({ efforts, expected }) => {
-    const profile = resolveThinkingProfile({
-      provider: "openai",
-      modelId: "gpt-5.6-sol",
-      agentRuntime: "codex",
-      api: "openai-chatgpt-responses",
-      compat: { supportedReasoningEfforts: efforts },
-    });
+    { efforts: [], expected: [], defaultLevel: undefined },
+    {
+      efforts: ["high"],
+      expected: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      defaultLevel: "medium",
+    },
+  ])(
+    "distinguishes an explicit empty Codex effort list from an incomplete one",
+    ({ efforts, expected, defaultLevel }) => {
+      const profile = resolveThinkingProfile({
+        provider: "openai",
+        modelId: "gpt-5.6-sol",
+        agentRuntime: "codex",
+        api: "openai-chatgpt-responses",
+        compat: { supportedReasoningEfforts: efforts },
+      });
 
-    expect(profile?.levels.map((level) => level.id)).toEqual(expected);
-    expect(profile?.defaultLevel).toBeUndefined();
-  });
+      expect(profile?.levels.map((level) => level.id)).toEqual(expected);
+      expect(profile?.defaultLevel).toBe(defaultLevel);
+    },
+  );
 
-  it("keeps Codex Luna capped at Max without authoritative Ultra metadata", () => {
+  it("keeps Codex Luna capped at Max when live metadata advertises Ultra", () => {
     const levels = resolveThinkingProfile({
       provider: "openai",
       modelId: "gpt-5.6-luna",
       agentRuntime: "codex",
-      api: "openai-responses",
+      api: "openai-chatgpt-responses",
       compat: {
-        supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+        supportedReasoningEfforts: ["low", "ultra"],
       },
     })?.levels.map((level) => level.id);
 
-    expect(levels).toContain("max");
-    expect(levels).not.toContain("ultra");
+    expect(levels).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
   it("orders Platform before ChatGPT for unconfigured routable models", () => {
     const expected = {
       kind: "routes",
       defaultRuntimeId: "codex",
+      preferredAuthRequirement: "subscription",
       routes: [
         {
           api: "openai-responses",
@@ -710,29 +766,6 @@ describe("OpenAI provider policy artifact", () => {
     });
   });
 
-  it("inherits a provider adapter when the model overrides only its official base URL", () => {
-    expect(
-      resolveModelRoutes({
-        provider: "openai",
-        modelId: "gpt-5.5",
-        configuredModel: { baseUrl: "https://api.openai.com/v1" },
-        configuredProvider: { api: "openai-completions" },
-      }),
-    ).toEqual({
-      kind: "routes",
-      defaultRuntimeId: "openclaw",
-      routes: [
-        {
-          api: "openai-completions",
-          baseUrl: "https://api.openai.com/v1",
-          authRequirement: "api-key",
-          requestTransportOverrides: "none",
-          runtimePolicy: { compatibleIds: ["openclaw"] },
-        },
-      ],
-    });
-  });
-
   it("inherits lower custom endpoints without changing the model adapter", () => {
     for (const [api, authRequirement] of [
       ["openai-chatgpt-responses", "subscription"],
@@ -868,7 +901,7 @@ describe("OpenAI provider policy artifact", () => {
     }
   });
 
-  it("preserves explicit official completions and keeps them on OpenClaw", () => {
+  it("keeps explicit API route intent on official Completions", () => {
     expect(
       resolveModelRoutes({
         provider: "openai",
@@ -877,6 +910,7 @@ describe("OpenAI provider policy artifact", () => {
           api: "openai-completions",
           baseUrl: "https://api.openai.com/v1",
         },
+        routeIntent: { authRequirement: "api-key", source: "explicit" },
       }),
     ).toEqual({
       kind: "routes",

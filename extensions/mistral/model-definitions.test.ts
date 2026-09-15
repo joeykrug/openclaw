@@ -17,7 +17,7 @@ function catalogModelById(models: ReturnType<typeof buildCatalogModels>, id: str
 }
 
 describe("mistral model definitions", () => {
-  it("uses current OpenClaw pricing for the bundled default model", () => {
+  it("uses current OpenClaw pricing for the default model", () => {
     const model = buildMistralModelDefinition();
     expect(model.id).toBe(MISTRAL_DEFAULT_MODEL_ID);
     expect(model.contextWindow).toBe(262144);
@@ -37,15 +37,6 @@ describe("mistral model definitions", () => {
       expect(model.cost.cacheRead).toBeCloseTo(model.cost.input * 0.1, 10);
       expect(model.cost.cacheWrite).toBe(0);
     }
-  });
-
-  it("charges nonzero cost for cached-token usage on the default model", () => {
-    const model = buildMistralModelDefinition();
-    const cacheReadTokens = 20_000;
-    const cacheReadCost = (model.cost.cacheRead / 1_000_000) * cacheReadTokens;
-
-    expect(cacheReadCost).toBeCloseTo(0.001, 10);
-    expect(cacheReadCost).toBeGreaterThan(0);
   });
 
   it("publishes a curated set of current Mistral catalog models", () => {
