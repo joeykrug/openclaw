@@ -1872,7 +1872,7 @@ src/agents/sessions/extensions/loader.ts	7
 src/agents/sessions/extensions/runner.ts	17
 src/agents/sessions/extensions/types.ts	1
 src/agents/sessions/keybindings.ts	2
-src/agents/sessions/model-registry.ts	13
+src/agents/sessions/model-registry.ts	12
 src/agents/sessions/package-manager.ts	3
 src/agents/sessions/resolve-config-value.ts	1
 src/agents/sessions/sdk.ts	3
@@ -2324,7 +2324,6 @@ src/commands/doctor-heartbeat-main-session-repair.ts	1
 src/commands/doctor-heartbeat-scratch-migration.ts	5
 src/commands/doctor-main-session-recovery.ts	1
 src/commands/doctor-model-catalog-credentials.ts	1
-src/commands/doctor-plugin-model-catalog.ts	1
 src/commands/doctor-plugin-registry.ts	1
 src/commands/doctor-post-upgrade.ts	1
 src/commands/doctor-prompter.ts	1
